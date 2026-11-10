@@ -41,9 +41,10 @@ struct State {
 	bool               parallax   = false; // nudge the video when moving between home tiles
 	bool               resume     = false; // Resume after a game
 	int                launchfx   = 0;
+	int                autonext   = 0;     // Auto-next: 0 off, 1 in order, 2 shuffle
 	bool               pl_bak     = false; // playlists.bak exists: "Undo last change"
 	int                tint       = 0;     // Picture -> Colour     // game launch effect: 0 fade, 1 dive, 2 pull back
-	bool               auto_match = false; // a game tile without its own video: a note when Discover has wallpapers for it
+	bool               auto_match = false; // not used in this source
 	bool               game_hide  = false; // no video on the home screen while a game is open
 	std::string        playlist;           // the playlist that is on ("" = none)
 	std::string        game;               // title id of the running game ("" = none)
@@ -59,6 +60,7 @@ State              get_state();
 bool select_video(const std::string& path, std::string& error);
 bool set_enabled(bool on, std::string& error);
 void set_launchfx(int mode);
+void set_autonext(int mode);                            // Auto-next: 0 off, 1 in order, 2 shuffle
 void set_tint(int t);
 bool restore_playlists(std::string& error);            // Playlists: undo the last change (swap with playlists.bak)                                   // Picture -> Colour: 0 neutral .. 5 violet                            // game launch effect: 0 fade, 1 dive, 2 pull back
 std::string playlists_json();                           // [{"name":..,"on":..,"every":..,"shuffle":..,"videos":[paths]},..]
@@ -66,6 +68,19 @@ bool set_playlists(const std::string& text, std::string& error); // the page's w
 bool set_user_on(int id, bool on);                      // Users: LiveShell for this console user or not
 std::string users_json();                               // [{"id":..,"name":"..","on":true,"now":true},..]
 std::string user_avatar(int id);                        // the user's profile picture (PNG, "" = none)
+bool        save_avatar(int id, const std::string& png, std::string& error); // the user's animated avatar (PNG)
+bool        apng_rebuild(const std::string& in, std::string& anim, std::string& still, std::string& error, uint32_t max_side = 512); // liveshell_apng.cpp
+std::string apng_thumb(const std::string& path);         // a small moving preview of a library file (cached; "" = not allowed)
+bool        set_tile_from(const std::string& tid, const std::string& path, std::string& error); // animated game tile from the library
+bool        delete_tile(const std::string& tid);       // the tile's own icon again
+std::string tiles_json();                              // {"<TITLE ID>":"<library file>",..}
+bool        delete_avatar(int id);
+std::string anim_avatar(int id);                        // the user's animated avatar file ("" = none)
+std::string apngs_json(bool icons = false);             // the APNG library (avatars, or icons = animated tiles; storage + USB): [{"path","name","where","size"},..]
+std::string read_apng(const std::string& path);         // one of them ("" = not allowed / not there)
+bool        set_avatar_from(int id, const std::string& path, std::string& error);
+std::string keep_apng(const std::string& name, const std::string& png, bool icons = false); // an upload into the library (avatars or icons; its path)
+void        note_avatar_src(int id, const std::string& from);          // the library file a user's avatar came from
 void set_dim(int percent); // 0..80
 // Bumped after the PS5 wakes from rest mode: every listening socket closes and opens again.
 int  net_epoch();

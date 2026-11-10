@@ -23,6 +23,7 @@
 #include <cctype>
 #include <cstring>
 #include <string>
+#include <dirent.h>
 #include <fcntl.h>
 #include <initializer_list>
 #include <pthread.h>
@@ -52,11 +53,69 @@ bool has_hv_bypass = false;
 namespace {
 
 constexpr const char* kPathFile   = "/system_tmp/liveshell/video.txt";
+constexpr const char* kOptsFile   = "/system_tmp/liveshell/opts.txt"; // the small settings, "name<TAB>value" lines
 constexpr const char* kLogFile    = "/system_tmp/liveshell/shellui.log";
 constexpr const char* kGuardFile  = "/system_tmp/liveshell/video_trying";
 constexpr const char* kStatusFile = "/system_tmp/liveshell/status.txt";
 constexpr const char* kDimFile    = "/system_tmp/liveshell/dim.txt";
 constexpr const char* kVolumeFile = "/system_tmp/liveshell/volume.txt";
+
+// /system_tmp holds only ~33 files for the whole console (issue #14), so the small settings are lines of one
+// file, opts.txt. opt_open("/system_tmp/liveshell/dim.txt") gives that one value, read like the file was.
+struct OptFile {
+	char   v[128];
+	size_t pos;
+};
+
+OptFile* opt_open(const char* path) {
+	const char* base = strrchr(path, '/');
+	base             = base != nullptr ? base + 1 : path;
+	FILE* f          = fopen(kOptsFile, "r");
+	if (f == nullptr) {
+		return nullptr;
+	}
+	static thread_local OptFile slots[4];
+	static thread_local int     slot = 0;
+	char                        line[256];
+	OptFile*                    out = nullptr;
+	const size_t                bl  = strlen(base);
+	while (out == nullptr && fgets(line, sizeof(line), f) != nullptr) {
+		if (strncmp(line, base, bl) == 0 && line[bl] == '\t') {
+			out = &slots[slot = (slot + 1) % 4];
+			snprintf(out->v, sizeof(out->v), "%s", line + bl + 1);
+			out->pos = 0;
+		}
+	}
+	fclose(f);
+	return out;
+}
+
+// The readers only ever scan "%d" fields: one int per "%d" in fmt, like fscanf's count.
+int opt_scanf(OptFile* f, const char* fmt, ...) {
+	va_list ap;
+	va_start(ap, fmt);
+	int         got = 0;
+	const char* at  = f->v + f->pos;
+	for (const char* c = fmt; (c = strstr(c, "%d")) != nullptr; c += 2) {
+		char*      end = nullptr;
+		const long n   = strtol(at, &end, 10);
+		if (end == at) {
+			break;
+		}
+		*va_arg(ap, int*) = static_cast<int>(n);
+		at                = end;
+		++got;
+	}
+	va_end(ap);
+	f->pos = static_cast<size_t>(at - f->v);
+	return got;
+}
+
+int opt_getc(OptFile* f) {
+	return f->v[f->pos] != 0 ? static_cast<unsigned char>(f->v[f->pos++]) : EOF;
+}
+
+void opt_close(OptFile*) {}
 constexpr off_t       kLogMaxSize = 12 * 1024; // ShellUI's files stop growing at ~16 KB (test v11-9)
 
 // ---- logging ---------------------------------------------------------------------------------
@@ -204,6 +263,9 @@ void*  (*mono_object_unbox)(Obj obj);
 Obj    (*mono_object_to_string)(Obj obj, Obj* exc);
 char*  (*mono_string_to_utf8)(Obj str);
 uint32_t (*mono_gchandle_new)(Obj obj, int pinned);
+int64_t (*mono_gc_get_heap_size)()                          = nullptr; // optional: memory notes (kept players)
+int64_t (*mono_gc_get_used_size)()                          = nullptr; // optional: memory notes - what is really alive
+int (*sceKernelAvailableFlexibleMemorySize)(size_t* size) = nullptr; // optional: memory notes (kept players)
 Obj    (*mono_method_desc_new)(const char* name, int include_namespace);
 Obj    (*mono_method_desc_search_in_class)(Obj desc, Obj klass);
 void   (*mono_method_desc_free)(Obj desc);
@@ -234,6 +296,14 @@ void        (*mono_field_static_get_value)(Obj vtable, Obj field, void* value);
 Obj         (*mono_signature_get_params)(Obj sig, void** iter);
 void        (*mono_method_get_param_names)(Obj method, const char** names);
 Obj         (*mono_class_get)(Obj image, uint32_t token);
+#ifdef LIVESHELL_RESEARCH_RETRO
+Obj         (*mono_array_new)(Obj domain, Obj eclass, uintptr_t n);
+Obj         (*mono_get_byte_class)();
+#endif
+#ifdef LIVESHELL_RESEARCH_DUMP
+void        (*mono_assembly_foreach)(void (*func)(void* assembly, void* data), void* data);
+const char* (*mono_image_get_name)(Obj image);
+#endif
 const char* (*mono_class_get_name)(Obj klass);
 
 std::atomic<const char*> g_step{"start"};
@@ -257,9 +327,21 @@ void* heartbeat_thread(void*) {
 	return nullptr;
 }
 
+// Early after power-on (issue #16) the home screen died during these lookups: log each one then, so the last
+// line names the call that killed it. Later starts stay quiet.
+bool early_boot() {
+	timespec up {};
+	clock_gettime(CLOCK_MONOTONIC, &up);
+	return up.tv_sec < 300;
+}
+
 template <typename T>
 bool resolve(int handle, T& fn, const char* name) {
 	g_step.store(name);
+	static const bool early = early_boot();
+	if (early) {
+		wp_log("early boot: dlsym %s", name);
+	}
 	fn = reinterpret_cast<T>(kernel_dynlib_dlsym(-1, static_cast<uint32_t>(handle), name));
 	if (fn == nullptr) {
 		wp_log("missing Mono symbol: %s", name);
@@ -278,7 +360,10 @@ bool resolve_kernel() {
 	}
 	sceKernelMprotect = reinterpret_cast<int (*)(void*, size_t, int)>(
 	    kernel_dynlib_dlsym(-1, static_cast<uint32_t>(lib), "sceKernelMprotect"));
-	wp_log("libkernel_sys handle %d, sceKernelMprotect %p", lib, reinterpret_cast<void*>(sceKernelMprotect));
+	sceKernelAvailableFlexibleMemorySize = reinterpret_cast<int (*)(size_t*)>(
+	    kernel_dynlib_dlsym(-1, static_cast<uint32_t>(lib), "sceKernelAvailableFlexibleMemorySize"));
+	wp_log("libkernel_sys handle %d, sceKernelMprotect %p, flexible memory query %p", lib, reinterpret_cast<void*>(sceKernelMprotect),
+	       reinterpret_cast<void*>(sceKernelAvailableFlexibleMemorySize));
 	return sceKernelMprotect != nullptr;
 }
 
@@ -307,6 +392,8 @@ bool resolve_mono() {
 		RESOLVE(mono_object_to_string);
 		RESOLVE(mono_string_to_utf8);
 		RESOLVE(mono_gchandle_new);
+		resolve(lib, mono_gc_get_heap_size, "mono_gc_get_heap_size"); // optional
+		resolve(lib, mono_gc_get_used_size, "mono_gc_get_used_size"); // optional
 		RESOLVE(mono_method_desc_new);
 		RESOLVE(mono_method_desc_search_in_class);
 		RESOLVE(mono_method_desc_free);
@@ -337,6 +424,14 @@ bool resolve_mono() {
 		resolve(lib, mono_method_get_param_names, "mono_method_get_param_names");
 		resolve(lib, mono_class_get, "mono_class_get");
 		resolve(lib, mono_class_get_name, "mono_class_get_name");
+#ifdef LIVESHELL_RESEARCH_RETRO
+		resolve(lib, mono_array_new, "mono_array_new");
+		resolve(lib, mono_get_byte_class, "mono_get_byte_class");
+#endif
+#ifdef LIVESHELL_RESEARCH_DUMP
+		resolve(lib, mono_assembly_foreach, "mono_assembly_foreach");
+		resolve(lib, mono_image_get_name, "mono_image_get_name");
+#endif
 	}
 	wp_log("libmonosgen handle %d, symbols %s", lib, ok ? "ok" : "MISSING");
 	return ok;
@@ -586,13 +681,13 @@ char     g_resume_clip[512] = {};
 uint64_t g_resume_pos       = 0;
 
 bool resume_on() {
-	FILE* f  = fopen("/system_tmp/liveshell/resume.txt", "r");
+	OptFile* f  = opt_open("/system_tmp/liveshell/resume.txt");
 	int   on = 0;
 	if (f != nullptr) {
-		if (fscanf(f, "%d", &on) != 1) {
+		if (opt_scanf(f, "%d", &on) != 1) {
 			on = 0;
 		}
-		fclose(f);
+		opt_close(f);
 	}
 	return on == 1;
 }
@@ -799,6 +894,8 @@ char g_play_path[512]    = {};    // what plays
 char g_uhd_name[256]     = {};    // the 4K clip's file name (its stream address)
 
 void begin_swap(const char* path);
+extern bool g_stopping; // defined further down (the watchdog needs them)
+extern int  g_switch_at;
 
 // fast.txt: "^<path>\t<file name>\t" for every 4K clip.
 bool uhd_lookup(const char* path, char* name, size_t nn, char* copy, size_t cn) {
@@ -832,23 +929,23 @@ bool uhd_lookup(const char* path, char* name, size_t nn, char* copy, size_t cn) 
 
 // A game is open: in front, or still running in the background (the payload's check, every second).
 bool game_alive() {
-	FILE* f = fopen("/system_tmp/liveshell/gamealive.txt", "r");
+	OptFile* f = opt_open("/system_tmp/liveshell/gamealive.txt");
 	if (f == nullptr) {
 		return false;
 	}
-	const int c = fgetc(f);
-	fclose(f);
+	const int c = opt_getc(f);
+	opt_close(f);
 	return c == '1';
 }
 
 // The LiveShell window is in front (the payload's check, every second): the video behind it is paused.
 bool window_open() {
-	FILE* f = fopen("/system_tmp/liveshell/window.txt", "r");
+	OptFile* f = opt_open("/system_tmp/liveshell/window.txt");
 	if (f == nullptr) {
 		return false;
 	}
-	const int c = fgetc(f);
-	fclose(f);
+	const int c = opt_getc(f);
+	opt_close(f);
 	return c == '1';
 }
 
@@ -874,6 +971,10 @@ bool set_option_field(Obj klass, Obj obj, const char* name, void* value) {
 	return true;
 }
 
+bool unpark(const char* path, Obj player_class, Obj view_class); // kept players (v1.7.0), below
+bool park_current();
+void park_tick();
+
 int start_own_player() {
 	Obj pui   = open_image("/system_ex/common_ex/lib/Sce.PlayStation.PUI.dll");
 	Obj video = open_image("/system_ex/common_ex/lib/Sce.Vsh.VideoPlayer.dll");
@@ -892,6 +993,9 @@ int start_own_player() {
 		return 41;
 	}
 	g_videoview_class = view_class;
+	if (unpark(g_play_path[0] != 0 ? g_play_path : g_video_path, player_class, view_class)) {
+		return 0; // a kept player of this clip: no new one
+	}
 
 	Obj     uri          = mono_string_new(g_domain, g_play_path[0] != 0 ? g_play_path : g_video_path);
 	Obj     content_type = mono_string_new(g_domain, "video/mp4");
@@ -1003,7 +1107,7 @@ int start_own_player() {
 	void* init_args[1] = {&load};
 	invoke(mono_class_get_method_from_name(player_class, "Init", 1), player, init_args, "Init");
 	// Resume after a game: the same clip goes on where it stopped (VideoView.Play(ulong ms)); else from the start.
-	uint64_t from = resume_on() && g_resume_pos > 0 && strcmp(g_resume_clip, g_video_path) == 0 ? g_resume_pos : 0;
+	uint64_t from = resume_on() && g_resume_pos > 0 && strcmp(g_resume_clip, g_video_path) == 0 && !g_play_uhd ? g_resume_pos : 0; // 4K: from 0
 	g_resume_pos  = 0; // once
 	Obj   play_at = from > 0 ? method_by_desc(view_class, ":Play(ulong)") : nullptr;
 	void* at_args[1] = {&from};
@@ -1137,6 +1241,15 @@ void own_player_report() {
 		    d != nullptr ? *static_cast<unsigned long long*>(mono_object_unbox(d)) : 0;
 		static int at_end = 0;
 		at_end = dur > 0 && pos >= dur ? at_end + 1 : 0;
+		// "Next video when one ends" (issue #11): ~0.7 s before the end, once per loop, the payload hears
+		// which clip ended (it decides whether to change; it ignores this when the option is off).
+		static bool end_sent = false;
+		if (dur > 2000 && pos + 700 >= dur && !end_sent) {
+			end_sent = true;
+			to_payload('E', g_video_path, strlen(g_video_path));
+		} else if (dur > 0 && pos < dur / 2) {
+			end_sent = false;
+		}
 		// Watchdog: the position has not moved for ~3 s (not at the end): after rest mode the
 		// player stays frozen and nothing restarted it (user report). Restart the clip.
 		static unsigned long long last_pos = ~0ull;
@@ -1174,6 +1287,22 @@ void own_player_report() {
 		}
 		if (g_hidden || g_tick - g_hide_changed < 180 || win || g_own_frames - win_closed < 180) {
 			frozen = 0; // paused on purpose (hidden, or behind our window): that is no freeze
+		}
+		// Never opened (no duration 5 s after the start, e.g. a 4K stream started while a game was still
+		// letting go of the decoder): black until a tile move. Start it fresh, at most 3 times per clip -
+		// a paused or hidden video always knows its duration, so this is never a pause on purpose.
+		static char never_clip[512] = {};
+		static int  never_tries     = 0;
+		if (dur == 0 && pos == 0 && g_own_frames >= 300 && g_own_frames % 300 == 0 && !win && !g_stopping && g_switch_at < 0) {
+			if (strcmp(never_clip, g_video_path) != 0) {
+				snprintf(never_clip, sizeof(never_clip), "%s", g_video_path);
+				never_tries = 0;
+			}
+			if (never_tries < 3) {
+				++never_tries;
+				wp_log("watchdog: %s never opened (5 s) - starting it fresh (%d/3)", g_video_path, never_tries);
+				begin_swap(g_video_path);
+			}
 		}
 		if (frozen >= (g_play_uhd ? 24 : 12) && !g_stalled) { // a 4K stream: 6 s (it was restarted while fine)
 			frozen = 0;
@@ -1820,8 +1949,9 @@ constexpr const char* kLooksFile = "/system_tmp/liveshell/looks.txt";
 enum Look { kBottom = 0, kTop = 1, kVignette = 2, kHaze = 3, kLooks = 4 };
 std::atomic<int> g_look_req[kLooks];
 int              g_look_shown[kLooks] = {-1, -1, -1, -1};
-Obj              g_look_panels[kLooks][40];
-float            g_look_weight[kLooks][40];
+constexpr int    kLookMax = 292; // panels per look (the vignette: 72 strips x 4 edges)
+Obj              g_look_panels[kLooks][kLookMax];
+float            g_look_weight[kLooks][kLookMax];
 int              g_look_count[kLooks] = {};
 bool             g_look_built[kLooks] = {};
 
@@ -1837,7 +1967,7 @@ void* tint(float r, float g, float b, float a) {
 }
 
 bool add_band(Look look, float x, float y, float w, float h, float weight) {
-	if (g_look_count[look] >= 40) {
+	if (g_look_count[look] >= kLookMax) {
 		return false;
 	}
 	Obj ctor  = mono_class_get_method_from_name(g_dim_class, ".ctor", 0);
@@ -1885,17 +2015,19 @@ void build_look(Look look) {
 			add_band(look, 0.0f, y, W, band + 1.0f, edge);
 		}
 	} else if (look == kVignette) {
-		// 10 rings of edge strips (no overlap at the corners), darkest at the screen edge.
-		const int   rings = 10;
-		const float tx = 34.0f, ty = 20.0f;
+		// 72 thin strips per edge (~5 x 3 px), darkest at the edge, fading out over ~384 x 224 px. The step from
+		// one strip to the next stays below ~2.4 % (k^2: no steep start at the edge), too small to see as a band:
+		// 10 wide rings showed boxes (v1.5.0), 32 strips with k^3 still showed steps (user). Top / bottom run the
+		// full width, left / right the full height: they overlap in the corners (a little darker), no seams.
+		const int   rings = 72;
+		const float tx = 384.0f / rings, ty = 224.0f / rings;
 		for (int i = 0; i < rings; ++i) {
 			const float k  = 1.0f - static_cast<float>(i) / rings;
 			const float wt = k * k;
-			const float x0 = i * tx, y0 = i * ty;
-			add_band(look, x0, y0, W - 2 * x0, ty, wt);                       // top
-			add_band(look, x0, H - y0 - ty, W - 2 * x0, ty, wt);              // bottom
-			add_band(look, x0, y0 + ty, tx, H - 2 * (y0 + ty), wt);           // left
-			add_band(look, W - x0 - tx, y0 + ty, tx, H - 2 * (y0 + ty), wt);  // right
+			add_band(look, 0.0f, i * ty, W, ty, wt);              // top
+			add_band(look, 0.0f, H - (i + 1) * ty, W, ty, wt);    // bottom
+			add_band(look, i * tx, 0.0f, tx, H, wt);              // left
+			add_band(look, W - (i + 1) * tx, 0.0f, tx, H, wt);    // right
 		}
 	} else {
 		add_band(look, 0.0f, 0.0f, W, H, 1.0f); // haze: one white veil
@@ -1978,13 +2110,13 @@ bool  g_self_started = false; // started on the return from a game, the payload 
 // "Hide while a game is open" (option): the payload writes 1 while a game is open in the background;
 // then ShellUI does not start a video by itself (return from a game, tile move) - Sony's art stays.
 bool game_open_hold() {
-	FILE* f = fopen("/system_tmp/liveshell/gameopen.txt", "r");
+	OptFile* f = opt_open("/system_tmp/liveshell/gameopen.txt");
 	int   v = 0;
 	if (f != nullptr) {
-		if (fscanf(f, "%d", &v) != 1) {
+		if (opt_scanf(f, "%d", &v) != 1) {
 			v = 0;
 		}
-		fclose(f);
+		opt_close(f);
 	}
 	return v == 1;
 }
@@ -2366,7 +2498,9 @@ void focus_tick() {
 			// Black now: swap the clip at once (no 2 s release wait; same folder stays mounted), then
 			// hold black until the new view is there and cross-fade into it.
 			g_switch_at = -1;
-			stop_video();
+			if (!park_current()) { // the clip you leave is kept (v1.7.0); else stopped as before
+				stop_video();
+			}
 			if (g_switch_path[0] == 0) { // a tile without video: no new clip, lift the black at once
 				write_status("stopped");
 				g_hold_black     = true;
@@ -2861,6 +2995,1072 @@ uint64_t setsysbgm_hook(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t
 // Highlighted tile -> per-game clip; SetSystemBgm (JObject, IPromise: this + 2 pointers) -> game music.
 int g_sysbgm_at = -1; // when to hook SetSystemBgm
 
+void avatar_tick();
+
+#ifdef LIVESHELL_RESEARCH_RETRO
+// ---- RESEARCH BUILD ONLY: a Game Boy on the home screen (games on the home screen, in development) ----
+// The payload runs the emulator (liveshell_retro.c) and sends every frame here (UDP 127.0.0.1:9053, 3 packets of
+// 48 lines, one byte per pixel: the shade 0..3); this module turns it into Game Boy green and puts it into the
+// texture. Before: a 60 fps test pattern proved the picture can change every frame (SetPixels ~0.05 ms).
+// A Game Boy sized texture (160 x 144, RGBA: Sce.PlayStation.Core.Graphics.Texture2D) in an image box on the
+// wallpaper layer, 3x (480 x 432), new pixels every frame (SetPixels from a byte[] we write straight into).
+// The log says how many frames per second the pixels changed and how long SetPixels took.
+constexpr int kRw = 160, kRh = 144;
+Obj   g_rt_tex = nullptr, g_rt_set = nullptr, g_rt_arr = nullptr, g_rt_box = nullptr;
+// two pictures, in turn: one on screen, one written (shown at the next refresh)
+constexpr int kRtPics = 2;
+Obj   g_rt_pic[kRtPics] {}, g_rt_asset[kRtPics] {}, g_pop_img = nullptr;
+int   g_rt_npic = 1;
+int   g_rt_frame = 0, g_rt_start = 0, g_rt_fail = 0;
+long  g_rt_t0 = 0, g_rt_us = 0, g_rt_n = 0;
+
+// A method by name, parameter count and the type name of one parameter (overloads with the same count).
+Obj method_where(Obj klass, const char* name, int argc, int at, const char* type) {
+	void* iter = nullptr;
+	while (Obj m = mono_class_get_methods(klass, &iter)) {
+		const char* n = mono_method_get_name(m);
+		if (n == nullptr || strcmp(n, name) != 0) {
+			continue;
+		}
+		Obj   sig = mono_method_signature(m);
+		void* pi  = nullptr;
+		int   i = 0, hit = 0;
+		while (Obj t = mono_signature_get_params(sig, &pi)) {
+			const char* tn = type_name_of(t);
+			if (i == at && strstr(tn, type) != nullptr) {
+				hit = 1;
+			}
+			++i;
+		}
+		if (i == argc && hit) {
+			return m;
+		}
+	}
+	return nullptr;
+}
+
+uint16_t          g_rf[144 * 160];     // the latest whole frame from the payload (RGB565)
+char              g_rf_title[96] = "Game Boy"; // the game's name (from the payload)
+// the menu's game list (from the payload): names, which one is loaded
+constexpr int     kMaxGames = 200;
+char              g_gl_name[kMaxGames][96];
+int               g_gl_con[kMaxGames]; // its console: 0 Game Boy, 1 Game Boy Color
+std::atomic<int>  g_gl_total{0}, g_gl_cur{-1}, g_gl_new{0};
+std::atomic<int>  g_rf_title_new{0};
+std::atomic<uint32_t> g_rf_ready{0};   // its number + 1 (0: none yet)
+std::atomic<uint32_t> g_rf_seq{0};     // odd while g_rf is being written (the reader copies again: no torn frames)
+
+void* retro_rx_thread(void*) {
+	const int   s = socket(AF_INET, SOCK_DGRAM, 0);
+	sockaddr_in a {};
+	a.sin_family      = AF_INET;
+	a.sin_port        = htons(9053);
+	a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	if (s < 0 || bind(s, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0) {
+		wp_log("retro: cannot listen on 9053");
+		return nullptr;
+	}
+	static uint8_t  pkt[6 + 24 * 160 * 2 + 1];
+	static uint16_t part_buf[144 * 160];
+	uint32_t       cur = 0;
+	int            parts = 0;
+	for (;;) {
+		const ssize_t n = recv(s, pkt, sizeof(pkt), 0);
+		if (n > 1 && pkt[0] == 'L') { // the game list: "L<total>\t<loaded>\t<first>\n" + "<id>\t<console>\t<name>\n" ...
+			pkt[n < static_cast<ssize_t>(sizeof(pkt)) ? n : sizeof(pkt) - 1] = 0;
+			char* line = reinterpret_cast<char*>(pkt) + 1;
+			const int total = atoi(line);
+			char* t1 = strchr(line, '\t');
+			const int cur = t1 != nullptr ? atoi(t1 + 1) : -1;
+			for (char* nl = strchr(line, '\n'); nl != nullptr;) {
+				char* row = nl + 1;
+				nl        = strchr(row, '\n');
+				if (nl == nullptr) {
+					break;
+				}
+				*nl = 0;
+				char* tab = strchr(row, '\t');
+				char* tab2 = tab != nullptr ? strchr(tab + 1, '\t') : nullptr;
+				const int id = atoi(row);
+				if (tab2 != nullptr && id >= 0 && id < kMaxGames) {
+					g_gl_con[id] = atoi(tab + 1) == 1 ? 1 : 0;
+					snprintf(g_gl_name[id], sizeof(g_gl_name[id]), "%s", tab2 + 1);
+				}
+			}
+			g_gl_total.store(total < kMaxGames ? total : kMaxGames);
+			g_gl_cur.store(cur);
+			g_gl_new.store(1);
+			continue;
+		}
+		if (n > 1 && n < 96 && pkt[0] == 'T') { // the game's name
+			memcpy(g_rf_title, pkt + 1, static_cast<size_t>(n - 1));
+			g_rf_title[n - 1] = 0;
+			g_rf_title_new.store(1);
+			continue;
+		}
+		if (n != static_cast<ssize_t>(6 + 24 * 160 * 2) || pkt[0] != 'H' || pkt[5] > 5) {
+			continue;
+		}
+		uint32_t f = 0;
+		memcpy(&f, pkt + 1, 4);
+		if (f != cur) {
+			cur   = f;
+			parts = 0;
+		}
+		memcpy(part_buf + pkt[5] * 24 * 160, pkt + 6, 24 * 160 * 2);
+		parts |= 1 << pkt[5];
+		if (parts == 0x3F) {
+			g_rf_seq.fetch_add(1); // odd: writing
+			memcpy(g_rf, part_buf, sizeof(g_rf));
+			g_rf_seq.fetch_add(1); // even: done
+			g_rf_ready.store(f + 1);
+		}
+	}
+	return nullptr;
+}
+
+// ---- controls: hold R3 0.5 s -> the controller plays the game (and back) ----
+struct PadData { // Sce.PlayStation.Core.Input.GamePadData
+	bool     Skip;
+	uint32_t Buttons, ButtonsPrev, ButtonsDown, ButtonsUp;
+	float    LeftX, LeftY, RightX, RightY;
+};
+using GetDataFn = PadData (*)(int device);
+GetDataFn   g_getdata_orig = nullptr;
+bool        g_game_mode = false; // playing (the pop-up)
+std::atomic<int> g_mode{0};      // 0 home screen, 1 LiveShell Menu, 2 playing
+std::atomic<uint32_t> g_menu_keys{0}; // menu presses (edges) for the frame tick: bit 0 up, 1 down, 2 left, 3 right, 4 cross, 5 circle
+long        g_r3_since  = 0;
+bool        g_r3_done   = false;
+int         g_joy_sock  = -1;
+sockaddr_in g_joy_to {};
+
+void joy_send(char kind, uint8_t value) {
+	if (g_joy_sock < 0) {
+		g_joy_sock               = socket(AF_INET, SOCK_DGRAM, 0);
+		g_joy_to.sin_family      = AF_INET;
+		g_joy_to.sin_port        = htons(9054);
+		g_joy_to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	}
+	const char pkt[2] = {kind, static_cast<char>(value)};
+	(void)sendto(g_joy_sock, pkt, 2, 0, reinterpret_cast<sockaddr*>(&g_joy_to), sizeof(g_joy_to));
+}
+
+PadData GetData_Hook(int device) {
+	PadData d = g_getdata_orig(device);
+	if (d.Buttons & 0x8000u) { // R3 held
+		const long t = now_ms();
+		if (g_r3_since == 0) {
+			g_r3_since = t;
+		} else if (!g_r3_done && t - g_r3_since >= 500) {
+			g_r3_done   = true;
+			const int m = g_mode.load();
+			// home -> menu, menu -> home, playing -> menu (the game pauses)
+			g_mode.store(m == 1 ? 0 : 1);
+			g_game_mode = false;
+			joy_send('M', 0);
+			joy_send('J', 0xFF);
+			if (m == 0) {
+				joy_send('Q', 0);
+			}
+			wp_log("retro: %s", m == 1 ? "menu closed" : "LiveShell Menu");
+		}
+	} else {
+		g_r3_since = 0;
+		g_r3_done  = false;
+	}
+	if (g_mode.load() == 0) {
+		return d;
+	}
+	if (g_mode.load() == 1) { // the menu: presses (with repeat while held) for the frame tick; the home screen sees nothing
+		static uint32_t held = 0;
+		static long     since = 0, rep_at = 0;
+		const uint32_t  dirs  = d.Buttons & 0xFu;
+		const uint32_t  now_b = d.Buttons;
+		const long      tm    = now_ms();
+		uint32_t        keys  = 0;
+		auto edge = [&](uint32_t mask) { return (now_b & mask) && !(held & mask); };
+		if (edge(0x2u)) keys |= 1;
+		if (edge(0x8u)) keys |= 2;
+		if (edge(0x1u)) keys |= 4;
+		if (edge(0x4u)) keys |= 8;
+		if (edge(0x80u)) keys |= 16;
+		if (edge(0x40u)) keys |= 32;
+		if (dirs != (held & 0xFu)) {
+			since = tm, rep_at = tm + 380;
+		} else if (dirs != 0 && tm >= rep_at) { // held: repeat up / down
+			rep_at = tm + 110;
+			keys |= (dirs & 0x2u ? 1 : 0) | (dirs & 0x8u ? 2 : 0);
+		}
+		(void)since;
+		held = now_b;
+		if (keys != 0) {
+			g_menu_keys.fetch_or(keys);
+		}
+		d.Buttons &= 0x8000u;
+		d.ButtonsPrev = d.ButtonsDown = d.ButtonsUp = 0;
+		d.LeftX = d.LeftY = d.RightX = d.RightY = 0.0f;
+		return d;
+	}
+	// playing: Game Boy buttons (0 = pressed): d-pad / left stick, cross or circle = A, square or triangle = B,
+	// Options = START, Create = SELECT
+	const uint32_t b = d.Buttons;
+	uint8_t        j = 0xFF;
+	if ((b & 0x80u) || (b & 0x40u)) j &= ~0x01; // A
+	if ((b & 0x10u) || (b & 0x20u)) j &= ~0x02; // B
+	if (b & 0x200u) j &= ~0x04;                 // SELECT
+	if (b & 0x100u) j &= ~0x08;                 // START
+	if ((b & 0x4u) || d.LeftX > 0.5f) j &= ~0x10;  // right
+	if ((b & 0x1u) || d.LeftX < -0.5f) j &= ~0x20; // left
+	if ((b & 0x2u) || d.LeftY < -0.5f) j &= ~0x40; // up
+	if ((b & 0x8u) || d.LeftY > 0.5f) j &= ~0x80;  // down
+	static uint8_t last = 0xFF;
+	static long    sent = 0;
+	const long     now  = now_ms();
+	if (j != last || now - sent >= 100) {
+		joy_send('J', j);
+		last = j;
+		sent = now;
+	}
+	// the home screen sees an idle controller (R3 stays visible: holding it again gives it back)
+	d.Buttons &= 0x8000u;
+	d.ButtonsPrev = d.ButtonsDown = d.ButtonsUp = 0;
+	d.LeftX = d.LeftY = d.RightX = d.RightY = 0.0f;
+	return d;
+}
+
+// The pop-up: a container (a dim over everything + the game 5x, 800 x 720, in the middle) appended as the LAST
+// child of the home screen's own scene (the AppScene in SceneManager's render list): drawn on top of the home
+// screen's content. Shown / hidden with Visible from the frame tick. (A scene of our own was Show()n "ok" but
+// never drawn: only scenes registered with the home screen's scene system are.)
+Obj  g_pop_box = nullptr, g_pop_wk = nullptr, g_pop_host = nullptr;
+bool g_pop_on  = false;
+
+Obj prop_up(Obj obj, const char* name) { // a property's value, looked up in the class and its parents
+	for (Obj k = obj != nullptr ? mono_object_get_class(obj) : nullptr; k != nullptr; k = mono_class_get_parent(k)) {
+		Obj prop = mono_class_get_property_from_name(k, name);
+		Obj get  = prop != nullptr ? mono_property_get_get_method(prop) : nullptr;
+		if (get != nullptr) {
+			Obj exc = nullptr;
+			Obj r   = mono_runtime_invoke(get, obj, nullptr, &exc);
+			return exc == nullptr ? r : nullptr;
+		}
+	}
+	return nullptr;
+}
+
+bool prop_set_up(Obj obj, const char* name, void* value) { // set a property found in the class or its parents
+	for (Obj k = obj != nullptr ? mono_object_get_class(obj) : nullptr; k != nullptr; k = mono_class_get_parent(k)) {
+		Obj prop = mono_class_get_property_from_name(k, name);
+		Obj set  = prop != nullptr ? mono_property_get_set_method(prop) : nullptr;
+		if (set != nullptr) {
+			void* args[1] = {value};
+			return invoke(set, obj, args, name);
+		}
+	}
+	wp_log("no setter %s (in any parent)", name);
+	return false;
+}
+
+// The home screen's scene root: the first AppScene in SceneManager's render list.
+Obj home_scene_root(Obj pui) {
+	Obj sm   = mono_class_from_name(pui, "Sce.PlayStation.PUI", "SceneManager");
+	Obj ip   = sm != nullptr ? mono_class_get_property_from_name(sm, "Instance") : nullptr;
+	Obj ig   = ip != nullptr ? mono_property_get_get_method(ip) : nullptr;
+	Obj exc  = nullptr;
+	Obj inst = ig != nullptr ? mono_runtime_invoke(ig, nullptr, nullptr, &exc) : nullptr;
+	Obj list = exc == nullptr && inst != nullptr ? prop_up(inst, "RenderList") : nullptr;
+	Obj cnt  = list != nullptr ? prop_up(list, "Count") : nullptr;
+	Obj item = list != nullptr ? mono_class_get_method_from_name(mono_object_get_class(list), "get_Item", 1) : nullptr;
+	const int n = cnt != nullptr ? *reinterpret_cast<int*>(static_cast<char*>(cnt) + 16) : 0;
+	for (int i = 0; i < n && item != nullptr; ++i) {
+		void* args[1] = {&i};
+		Obj   e       = nullptr;
+		Obj   sc      = mono_runtime_invoke(item, list, args, &e);
+		const char* cn = e == nullptr && sc != nullptr ? mono_class_get_name(mono_object_get_class(sc)) : nullptr;
+		if (cn != nullptr && strcmp(cn, "AppScene") == 0) {
+			return prop_up(sc, "RootWidget");
+		}
+	}
+	return nullptr;
+}
+
+void retro_popup_setup(Obj pui, Obj asset, Obj wk) {
+	Obj bk  = mono_class_from_name(pui, "Sce.PlayStation.PUI.UI3", "ImageBox");
+	Obj box = mono_object_new(g_domain, wk);
+	Obj wc  = mono_class_get_method_from_name(wk, ".ctor", 0);
+	if (box == nullptr || wc == nullptr || !invoke(wc, box, nullptr, "Widget(pop)")) {
+		wp_log("retro: no pop-up container");
+		return;
+	}
+	mono_gchandle_new(box, 1);
+	float z = 0.0f, fw = 1920.0f, fh = 1080.0f;
+	property_set(wk, box, "X", &z);
+	property_set(wk, box, "Y", &z);
+	property_set(wk, box, "Width", &fw);
+	property_set(wk, box, "Height", &fh);
+	Obj  apnd  = find_method_up(wk, "AppendChild", 1);
+	bool dimok = false;
+	if (g_dim_class != nullptr && g_dim_prop != nullptr) { // the dim: as the wallpaper's dim layer
+		Obj dim = mono_object_new(g_domain, g_dim_class);
+		Obj dc  = mono_class_get_method_from_name(g_dim_class, ".ctor", 0);
+		if (dim != nullptr && dc != nullptr && invoke(dc, dim, nullptr, "dim()")) {
+			property_set(wk, dim, "X", &z);
+			property_set(wk, dim, "Y", &z);
+			property_set(wk, dim, "Width", &fw);
+			property_set(wk, dim, "Height", &fh);
+			if (has_setter(g_dim_class, "BackgroundVisibility")) {
+				bool on = true;
+				property_set(g_dim_class, dim, "BackgroundVisibility", &on);
+			}
+			void* c    = black(0.72f);
+			void* a[1] = {dim};
+			dimok      = c != nullptr && property_set(g_dim_class, dim, g_dim_prop, c) && invoke(apnd, box, a, "AppendChild(pop dim)");
+		}
+	}
+	{ // the bezel: a retro frame around the screen (drawn for LiveShell, written by the payload)
+		Obj bz = bk != nullptr ? mono_object_new(g_domain, bk) : nullptr;
+		Obj zc = bk != nullptr ? mono_class_get_method_from_name(bk, ".ctor", 0) : nullptr;
+		Obj ld = bk != nullptr ? find_method_up(bk, "LoadAsync", 1) : nullptr;
+		if (bz != nullptr && zc != nullptr && invoke(zc, bz, nullptr, "ImageBox(bezel)")) {
+			mono_gchandle_new(bz, 1);
+			float bx = 420.0f, by = 48.0f, bw2 = 1080.0f, bh2 = 984.0f;
+			property_set(wk, bz, "X", &bx);
+			property_set(wk, bz, "Y", &by);
+			property_set(wk, bz, "Width", &bw2);
+			property_set(wk, bz, "Height", &bh2);
+			void* la[1] = {mono_string_new(g_domain, "/system_ex/vsh_asset/wallpaper/.retroui/bezel.png")};
+			if (ld != nullptr) {
+				invoke(ld, bz, la, "ImageBox.LoadAsync(bezel)");
+			}
+			void* ba[1] = {bz};
+			invoke(apnd, box, ba, "AppendChild(bezel)");
+		}
+	}
+	Obj big = bk != nullptr ? mono_object_new(g_domain, bk) : nullptr;
+	Obj bc  = bk != nullptr ? mono_class_get_method_from_name(bk, ".ctor", 0) : nullptr;
+	if (big == nullptr || bc == nullptr || !invoke(bc, big, nullptr, "ImageBox(pop)")) {
+		return;
+	}
+	mono_gchandle_new(big, 1);
+	g_pop_img = big;
+	property_set(bk, big, "Image", asset); // the same texture as the mini screen
+	float x = 480.0f, y = 108.0f, w = 960.0f, h = 864.0f; // 6x: the whole Game Boy screen, sharp
+	property_set(wk, big, "X", &x);
+	property_set(wk, big, "Y", &y);
+	property_set(wk, big, "Width", &w);
+	property_set(wk, big, "Height", &h);
+	void* a[1] = {big};
+	invoke(apnd, box, a, "AppendChild(pop game)");
+	bool off = false;
+	prop_set_up(box, "Visible", &off);
+	g_pop_box = box;
+	g_pop_wk  = wk;
+	wp_log("retro: pop-up ready (dim %s)", dimok ? "on" : "none");
+}
+
+// ---- the card: in the middle of the home screen when you stop playing (6 s) ----
+Obj g_card = nullptr, g_card_title = nullptr, g_label_class = nullptr;
+int g_card_until = 0;
+
+void* rgba(float r, float g, float b, float a) { // a UIColor
+	Obj boxed = g_color_class != nullptr ? mono_object_new(g_domain, g_color_class) : nullptr;
+	if (boxed == nullptr) {
+		return nullptr;
+	}
+	mono_gchandle_new(boxed, 1);
+	void* raw     = mono_object_unbox(boxed);
+	void* args[4] = {&r, &g, &b, &a};
+	return invoke(mono_class_get_method_from_name(g_color_class, ".ctor", 4), raw, args, "UIColor()") ? raw : nullptr;
+}
+
+Obj add_widget(Obj klass, Obj parent, Obj wk, float x, float y, float w, float h) {
+	Obj o = klass != nullptr ? mono_object_new(g_domain, klass) : nullptr;
+	Obj c = klass != nullptr ? mono_class_get_method_from_name(klass, ".ctor", 0) : nullptr;
+	if (o == nullptr || c == nullptr || !invoke(c, o, nullptr, "new widget")) {
+		return nullptr;
+	}
+	mono_gchandle_new(o, 1);
+	prop_set_up(o, "X", &x);
+	prop_set_up(o, "Y", &y);
+	prop_set_up(o, "Width", &w);
+	prop_set_up(o, "Height", &h);
+	if (parent != nullptr) {
+		void* a[1] = {o};
+		invoke(find_method_up(wk, "AppendChild", 1), parent, a, "AppendChild(card)");
+	}
+	return o;
+}
+
+Obj add_label(Obj parent, Obj wk, float y, float h, const char* text, float grey) {
+	Obj l = add_widget(g_label_class, parent, wk, 24.0f, y, 472.0f, h);
+	if (l != nullptr) {
+		prop_set_up(l, "Text", mono_string_new(g_domain, text));
+		if (void* c = rgba(grey, grey, grey, 1.0f)) {
+			prop_set_up(l, "TextColor", c);
+		}
+	}
+	return l;
+}
+
+void retro_card_setup(Obj pui, Obj asset, Obj wk) {
+	g_label_class = mono_class_from_name(pui, "Sce.PlayStation.PUI.UI3", "Label");
+	Obj bk        = mono_class_from_name(pui, "Sce.PlayStation.PUI.UI3", "ImageBox");
+	Obj card      = add_widget(wk, nullptr, wk, 700.0f, 250.0f, 520.0f, 560.0f); // the middle of the screen
+	if (card == nullptr) {
+		return;
+	}
+	if (g_dim_class != nullptr && g_dim_prop != nullptr) { // its background: a dark panel
+		Obj bg = add_widget(g_dim_class, card, wk, 0.0f, 0.0f, 520.0f, 560.0f);
+		if (bg != nullptr) {
+			if (has_setter(g_dim_class, "BackgroundVisibility")) {
+				bool on = true;
+				property_set(g_dim_class, bg, "BackgroundVisibility", &on);
+			}
+			if (void* c = rgba(0.07f, 0.07f, 0.08f, 0.94f)) {
+				property_set(g_dim_class, bg, g_dim_prop, c);
+			}
+		}
+	}
+	Obj img = add_widget(bk, card, wk, 20.0f, 20.0f, 480.0f, 432.0f); // the paused game, 3x
+	if (img != nullptr) {
+		prop_set_up(img, "Image", asset);
+	}
+	g_card_title = add_label(card, wk, 466.0f, 40.0f, g_rf_title, 1.0f);
+	add_label(card, wk, 506.0f, 34.0f, "Hold R3 to play", 0.62f);
+	bool off = false;
+	prop_set_up(card, "Visible", &off);
+	g_card = card;
+	wp_log("retro: card ready (label %p)", g_label_class);
+}
+
+// Put a widget on top of the home screen's own scene (its last child) and show / hide it.
+void show_on_home(Obj w, bool on) {
+	if (w == nullptr) {
+		return;
+	}
+	if (on) {
+		Obj pui  = open_image("/system_ex/common_ex/lib/Sce.PlayStation.PUI.dll");
+		Obj root = pui != nullptr ? home_scene_root(pui) : nullptr;
+		if (root != nullptr) {
+			if (prop_up(w, "Parent") != nullptr) {
+				invoke(find_method_up(g_pop_wk, "RemoveFromParent", 0), w, nullptr, "RemoveFromParent");
+			}
+			void* a[1] = {w};
+			invoke(find_method_up(g_pop_wk, "AppendChild", 1), root, a, "AppendChild(home)");
+		}
+	}
+	prop_set_up(w, "Visible", &on);
+}
+
+// ---- the LiveShell Menu: consoles left, the games as a list of names right ----
+constexpr int kRows = 7;
+Obj   g_menu = nullptr, g_panel_class = nullptr;
+const char* g_panel_prop = nullptr;
+constexpr int kCons = 2;
+const char* const kConName[kCons] = {"Game Boy", "Game Boy Color"};
+Obj   g_con_bg[kCons] {}, g_con_label[kCons] {}, g_con_count[kCons] {}, g_head = nullptr, g_empty = nullptr;
+int   g_con = 0; // the chosen console
+Obj   g_row_bg[kRows] {}, g_row_name[kRows] {}, g_row_tag[kRows] {};
+int   g_sel = 0, g_top = 0, g_focus = 1; // selected game, first row shown, focus: 0 consoles / 1 games
+
+void* ui_font(int size, bool bold) { // a UIFont (a struct: boxed, the data passed)
+	static Obj fk = nullptr;
+	if (fk == nullptr) {
+		Obj pui = open_image("/system_ex/common_ex/lib/Sce.PlayStation.PUI.dll");
+		fk      = pui != nullptr ? mono_class_from_name(pui, "Sce.PlayStation.PUI.UI3", "UIFont") : nullptr;
+	}
+	Obj boxed = fk != nullptr ? mono_object_new(g_domain, fk) : nullptr;
+	if (boxed == nullptr) {
+		return nullptr;
+	}
+	mono_gchandle_new(boxed, 1);
+	void* raw     = mono_object_unbox(boxed);
+	int   style = 0, weight = bold ? 2 : 1;
+	void* args[3] = {&size, &style, &weight};
+	return invoke(mono_class_get_method_from_name(fk, ".ctor", 3), raw, args, "UIFont()") ? raw : nullptr;
+}
+
+Obj panel(Obj parent, Obj wk, float x, float y, float w, float h, float grey, float alpha, float radius = 0.0f) {
+	Obj p = add_widget(g_panel_class, parent, wk, x, y, w, h);
+	if (p != nullptr) {
+		if (radius > 0.0f) {
+			prop_set_up(p, "BorderRadius", &radius);
+		}
+		if (has_setter(g_panel_class, "BackgroundVisibility")) {
+			bool on = true;
+			property_set(g_panel_class, p, "BackgroundVisibility", &on);
+		}
+		if (void* c = rgba(grey, grey, grey, alpha)) {
+			property_set(g_panel_class, p, g_panel_prop, c);
+		}
+	}
+	return p;
+}
+
+void tint(Obj p, float grey, float alpha) {
+	if (p != nullptr) {
+		if (void* c = rgba(grey, grey, grey, alpha)) {
+			property_set(g_panel_class, p, g_panel_prop, c);
+		}
+	}
+}
+
+Obj text(Obj parent, Obj wk, float x, float y, float w, float h, const char* t, int size, bool bold, float grey) {
+	Obj l = add_widget(g_label_class, parent, wk, x, y, w, h);
+	if (l != nullptr) {
+		if (void* f = ui_font(size, bold)) {
+			prop_set_up(l, "Font", f);
+		}
+		prop_set_up(l, "Text", mono_string_new(g_domain, t));
+		if (void* c = rgba(grey, grey, grey, 1.0f)) {
+			prop_set_up(l, "TextColor", c);
+		}
+	}
+	return l;
+}
+
+void set_text(Obj l, const char* t, float grey) {
+	if (l != nullptr) {
+		prop_set_up(l, "Text", mono_string_new(g_domain, t));
+		if (void* c = rgba(grey, grey, grey, 1.0f)) {
+			prop_set_up(l, "TextColor", c);
+		}
+	}
+}
+
+void retro_menu_setup(Obj pui, Obj wk) {
+	g_label_class = mono_class_from_name(pui, "Sce.PlayStation.PUI.UI3", "Label");
+	if (g_color_class == nullptr) {
+		g_color_class = mono_class_from_name(pui, "Sce.PlayStation.PUI", "UIColor");
+	}
+	// a widget that can be filled with a colour (as the dim layer finds it)
+	static const char* const kClasses[] = {"Panel", "Rectangle", "ColorRect", "Plane", "Box", "Widget"};
+	static const char* const kColors[]  = {"BackgroundColor", "Color", "FillColor", "BaseColor"};
+	for (const char* cn : kClasses) {
+		Obj k = mono_class_from_name(pui, "Sce.PlayStation.PUI.UI3", cn);
+		for (const char* c : kColors) {
+			if (k != nullptr && g_panel_prop == nullptr && has_setter(k, c)) {
+				g_panel_class = k;
+				g_panel_prop  = c;
+			}
+		}
+		if (g_panel_prop != nullptr) {
+			break;
+		}
+	}
+	if (g_panel_class == nullptr || g_label_class == nullptr || g_color_class == nullptr) {
+		wp_log("retro: menu classes panel %p label %p colour %p", g_panel_class, g_label_class, g_color_class);
+		return;
+	}
+	Obj m = add_widget(wk, nullptr, wk, 0.0f, 0.0f, 1920.0f, 1080.0f);
+	if (m == nullptr) {
+		return;
+	}
+	panel(m, wk, 0.0f, 0.0f, 1920.0f, 1080.0f, 0.0f, 0.6f); // the home screen a little darker behind it
+	// the card: solid, rounded, in the middle; everything else inside it
+	Obj card = panel(m, wk, 440.0f, 220.0f, 1040.0f, 640.0f, 0.07f, 1.0f, 28.0f);
+	if (card == nullptr) {
+		return;
+	}
+	text(card, wk, 40.0f, 30.0f, 600.0f, 50.0f, "PlayShell", 34, true, 1.0f);
+	g_head = text(card, wk, 40.0f, 80.0f, 600.0f, 32.0f, "Game Boy", 20, false, 0.6f);
+	panel(card, wk, 40.0f, 126.0f, 960.0f, 2.0f, 0.2f, 1.0f); // divider
+	// the consoles
+	for (int c = 0; c < kCons; ++c) {
+		const float y   = 148.0f + c * 106.0f;
+		g_con_bg[c]     = panel(card, wk, 40.0f, y, 250.0f, 96.0f, 0.14f, 1.0f, 16.0f);
+		{ // the console's icon (drawn for LiveShell, written by the payload)
+			Obj bk = mono_class_from_name(pui, "Sce.PlayStation.PUI.UI3", "ImageBox");
+			Obj ib = add_widget(bk, card, wk, 52.0f, y + 16.0f, 64.0f, 64.0f);
+			Obj ld = bk != nullptr ? find_method_up(bk, "LoadAsync", 1) : nullptr;
+			if (ib != nullptr && ld != nullptr) {
+				void* a[1] = {mono_string_new(g_domain, c == 0 ? "/system_ex/vsh_asset/wallpaper/.retroui/console_gb.png"
+				                                               : "/system_ex/vsh_asset/wallpaper/.retroui/console_gbc.png")};
+				invoke(ld, ib, a, "ImageBox.LoadAsync(console)");
+			}
+		}
+		g_con_label[c] = text(card, wk, 126.0f, y + 16.0f, 160.0f, 32.0f, kConName[c], 19, true, 1.0f); // full names
+		g_con_count[c] = text(card, wk, 128.0f, y + 52.0f, 156.0f, 28.0f, "0 games", 18, false, 0.6f);
+	}
+	// the games
+	for (int i = 0; i < kRows; ++i) {
+		const float y = 148.0f + i * 58.0f;
+		g_row_bg[i]   = panel(card, wk, 310.0f, y, 690.0f, 50.0f, 0.14f, 1.0f, 12.0f);
+		g_row_name[i] = text(card, wk, 332.0f, y + 9.0f, 520.0f, 34.0f, "", 22, false, 1.0f);
+		g_row_tag[i]  = text(card, wk, 870.0f, y + 12.0f, 120.0f, 28.0f, "", 18, false, 0.6f);
+	}
+	g_empty = text(card, wk, 310.0f, 156.0f, 690.0f, 80.0f, "No games yet. Put your games (.gb / .gbc) in /data/LiveShell/roms", 20, false, 0.7f);
+	// the footer: the hints on their own bar
+	panel(card, wk, 0.0f, 572.0f, 1040.0f, 68.0f, 0.12f, 1.0f, 28.0f); // rounded like the card at the bottom
+	panel(card, wk, 0.0f, 572.0f, 1040.0f, 34.0f, 0.12f, 1.0f);        // square at the top
+	// the hints: button icon + word (the icons: drawn for LiveShell, written by the payload)
+	{
+		Obj bk = mono_class_from_name(pui, "Sce.PlayStation.PUI.UI3", "ImageBox");
+		Obj ld = bk != nullptr ? find_method_up(bk, "LoadAsync", 1) : nullptr;
+		static const char* const icon[3] = {"cross", "circle", "r3"};
+		static const char* const word[3] = {"Play", "Close", "Hold  Menu"};
+		float x = 40.0f;
+		for (int i = 0; i < 3; ++i) {
+			Obj ib = add_widget(bk, card, wk, x, 588.0f, 36.0f, 36.0f);
+			if (ib != nullptr && ld != nullptr) {
+				char path[96];
+				snprintf(path, sizeof(path), "/system_ex/vsh_asset/wallpaper/.retroui/%s.png", icon[i]);
+				void* a[1] = {mono_string_new(g_domain, path)};
+				invoke(ld, ib, a, "ImageBox.LoadAsync(icon)");
+			}
+			text(card, wk, x + 46.0f, 592.0f, 160.0f, 32.0f, word[i], 20, false, 0.88f);
+			x += i == 1 ? 200.0f : 170.0f;
+		}
+	}
+	bool off = false;
+	prop_set_up(m, "Visible", &off);
+	g_menu = m;
+	wp_log("retro: menu ready (panel %s.%s)", mono_class_get_name(g_panel_class), g_panel_prop);
+}
+
+// The chosen console's games (ids in list order).
+int con_games(int con, int* ids) {
+	const int total = g_gl_total.load();
+	int       k     = 0;
+	for (int id = 0; id < total; ++id) {
+		if (g_gl_con[id] == con) {
+			ids[k++] = id;
+		}
+	}
+	return k;
+}
+
+void menu_render() {
+	static int ids[kMaxGames];
+	const int  total = con_games(g_con, ids), cur = g_gl_cur.load();
+	g_sel = total > 0 ? std::max(0, std::min(g_sel, total - 1)) : 0;
+	if (g_sel < g_top) {
+		g_top = g_sel;
+	} else if (g_sel >= g_top + kRows) {
+		g_top = g_sel - kRows + 1;
+	}
+	for (int c = 0; c < kCons; ++c) {
+		static int tmp[kMaxGames];
+		const int  k = con_games(c, tmp);
+		char       n[24];
+		snprintf(n, sizeof(n), "%d game%s", k, k == 1 ? "" : "s");
+		const bool chosen = c == g_con;
+		set_text(g_con_count[c], n, chosen ? 0.8f : 0.6f);
+		// the chosen one lighter; brighter still while the consoles have the focus
+		tint(g_con_bg[c], chosen ? (g_focus == 0 ? 0.36f : 0.24f) : 0.12f, 1.0f);
+		set_text(g_con_label[c], kConName[c], chosen ? 1.0f : 0.75f);
+	}
+	char head[64];
+	snprintf(head, sizeof(head), "%s  -  %d game%s", kConName[g_con], total, total == 1 ? "" : "s");
+	set_text(g_head, head, 0.6f);
+	bool show_empty = total == 0;
+	prop_set_up(g_empty, "Visible", &show_empty);
+	for (int i = 0; i < kRows; ++i) {
+		const int  row = g_top + i;
+		bool       vis = row < total;
+		prop_set_up(g_row_bg[i], "Visible", &vis);
+		prop_set_up(g_row_name[i], "Visible", &vis);
+		prop_set_up(g_row_tag[i], "Visible", &vis);
+		if (!vis) {
+			continue;
+		}
+		const int  id = ids[row];
+		const bool on = g_focus == 1 && row == g_sel;
+		tint(g_row_bg[i], on ? 1.0f : 0.13f, 1.0f);
+		set_text(g_row_name[i], g_gl_name[id], on ? 0.0f : 1.0f);
+		set_text(g_row_tag[i], id == cur ? "Continue" : "", on ? 0.3f : 0.6f);
+	}
+}
+
+// From the frame tick: open / close, the presses, the list.
+void retro_menu_tick() {
+	static int shown = 0;
+	const int  mode  = g_mode.load();
+	if (g_menu == nullptr) {
+		return;
+	}
+	if ((mode == 1) != (shown == 1)) {
+		shown = mode == 1;
+		if (shown) {
+			const int cur = g_gl_cur.load();
+			if (cur >= 0 && cur < kMaxGames) { // on the game you were playing, in its console
+				static int ids[kMaxGames];
+				g_con         = g_gl_con[cur];
+				const int k   = con_games(g_con, ids);
+				for (int i = 0; i < k; ++i) {
+					if (ids[i] == cur) {
+						g_sel = i;
+					}
+				}
+			}
+			g_focus = 1;
+			menu_render();
+		}
+		show_on_home(g_menu, shown == 1);
+	}
+	if (mode != 1) {
+		g_menu_keys.store(0);
+		return;
+	}
+	const uint32_t keys = g_menu_keys.exchange(0);
+	bool           redo = g_gl_new.exchange(0) != 0;
+	static int     ids[kMaxGames];
+	const int      total = con_games(g_con, ids);
+	// up / down: the games, or (focus on the consoles) the console - its list shows at once
+	if (keys & 1) { if (g_focus == 1) --g_sel; else if (g_con > 0) { --g_con; g_sel = g_top = 0; } redo = true; }
+	if (keys & 2) { if (g_focus == 1) ++g_sel; else if (g_con < kCons - 1) { ++g_con; g_sel = g_top = 0; } redo = true; }
+	if (keys & 4) { g_focus = 0; redo = true; }
+	if (keys & 8) { g_focus = total > 0 ? 1 : 0; redo = true; }
+	if (keys & 32) { // Circle: close
+		g_mode.store(0);
+		return;
+	}
+	if ((keys & 16) && g_focus == 0) {
+		g_focus = total > 0 ? 1 : 0;
+		redo    = true;
+		(void)total;
+	} else if ((keys & 16) && total > 0) { // Cross: play it
+		char cmd[16];
+		const int id = ids[std::max(0, std::min(g_sel, total - 1))];
+		const int k  = snprintf(cmd, sizeof(cmd), "P%d", id);
+		if (g_joy_sock < 0) {
+			joy_send('J', 0xFF);
+		}
+		(void)sendto(g_joy_sock, cmd, static_cast<size_t>(k), 0, reinterpret_cast<sockaddr*>(&g_joy_to), sizeof(g_joy_to));
+		g_mode.store(2);
+		g_game_mode = true;
+		wp_log("retro: play %s", g_gl_name[id]);
+		return;
+	}
+	if (redo) {
+		menu_render();
+	}
+}
+
+// From the frame tick (the UI thread): the pop-up follows the controller mode. Shown: (again) the last child of
+// the home screen's scene, so it is on top of whatever the home screen added since.
+void retro_popup_tick(bool playing) {
+	if (g_rf_title_new.exchange(0) && g_card_title != nullptr) {
+		prop_set_up(g_card_title, "Text", mono_string_new(g_domain, g_rf_title));
+	}
+	if (g_card_until != 0 && g_tick >= g_card_until) { // the card's 6 s are over
+		g_card_until = 0;
+		show_on_home(g_card, false);
+	}
+	if (g_pop_box == nullptr || playing == g_pop_on) {
+		return;
+	}
+	g_pop_on = playing;
+	if (g_own_player != nullptr && g_vplayer_class != nullptr) { // the game's sound alone while playing
+		player_mute(g_vplayer_class, g_own_player, playing || g_aud_muted);
+		set_bgm_suppression(g_vplayer_class, g_own_player, playing ? false : (g_aud_muted || g_clip_silent));
+		wp_log("retro: wallpaper sound %s, home music %s", playing ? "muted" : "back", playing ? "held back" : "as before");
+	}
+	if (playing) { // playing: no card
+		g_card_until = 0;
+		show_on_home(g_card, false);
+	}
+	if (playing) {
+		Obj pui  = open_image("/system_ex/common_ex/lib/Sce.PlayStation.PUI.dll");
+		Obj root = pui != nullptr ? home_scene_root(pui) : nullptr;
+		if (root != nullptr) {
+			Obj   rm      = find_method_up(g_pop_wk, "RemoveFromParent", 0);
+			Obj   parent  = prop_up(g_pop_box, "Parent");
+			void* a[1]    = {g_pop_box};
+			if (parent != nullptr && rm != nullptr) {
+				invoke(rm, g_pop_box, nullptr, "RemoveFromParent(pop)");
+			}
+			invoke(find_method_up(g_pop_wk, "AppendChild", 1), root, a, "AppendChild(pop)");
+			g_pop_host = root;
+		}
+		wp_log("retro: pop-up on the home screen's scene (%s)", root != nullptr ? "found" : "NOT found");
+	}
+	bool vis = playing;
+	const bool ok = prop_set_up(g_pop_box, "Visible", &vis);
+	wp_log("retro: pop-up %s (%s)", playing ? "shown" : "hidden", ok ? "ok" : "FAILED");
+}
+
+// ---- the game's sound, played from inside the home screen (the PS5 lets the home screen be heard) ----
+// the PS5's audio out, looked up in the home screen's own libSceAudioOut (no link: normal builds stay as they are)
+int (*sceAudioOutInit)(void)                                                                         = nullptr;
+int (*sceAudioOutOpen)(int32_t user_id, int32_t type, int32_t index, uint32_t len, uint32_t freq, uint32_t param) = nullptr;
+int (*sceAudioOutOutput)(int32_t handle, const void* buf)                                            = nullptr;
+
+void* retro_sound_thread(void*) {
+	const int   s = socket(AF_INET, SOCK_DGRAM, 0);
+	sockaddr_in a {};
+	a.sin_family      = AF_INET;
+	a.sin_port        = htons(9055);
+	a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	int big = 256 * 1024;
+	setsockopt(s, SOL_SOCKET, SO_RCVBUF, &big, sizeof(big));
+	if (s < 0 || bind(s, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0) {
+		wp_log("retro: sound: cannot listen on 9055");
+		return nullptr;
+	}
+	// looking up / loading modules in the home screen needs the raised authid (as for Mono's functions)
+	const uintptr_t old = set_ucred_to_ptrace();
+	int lib = get_module_handle(getpid(), "libSceAudioOut.sprx");
+	if (lib <= 0) { // not loaded in the home screen: load it (as the payload loads system libraries for the tile)
+		const int kh   = get_module_handle(getpid(), "libkernel_sys.sprx");
+		using LoadFn   = int (*)(const char*, size_t, const void*, uint32_t, const void*, int*);
+		LoadFn    load = kh > 0 ? reinterpret_cast<LoadFn>(kernel_dynlib_dlsym(-1, static_cast<uint32_t>(kh), "sceKernelLoadStartModule")) : nullptr;
+		for (const char* root : {"/system/common/lib/", "/system/priv/lib/", "/system_ex/common_ex/lib/"}) {
+			if (load == nullptr || lib > 0) {
+				break;
+			}
+			char path[96];
+			snprintf(path, sizeof(path), "%slibSceAudioOut.sprx", root);
+			int       res = 0;
+			const int id  = load(path, 0, nullptr, 0, nullptr, &res);
+			wp_log("retro: sound: load %s -> %#x (res %d)", path, static_cast<unsigned>(id), res);
+			if (id >= 0) {
+				lib = get_module_handle(getpid(), "libSceAudioOut.sprx");
+				lib = lib > 0 ? lib : id;
+			}
+		}
+	}
+	const bool found = lib > 0 && resolve(lib, sceAudioOutInit, "sceAudioOutInit") && resolve(lib, sceAudioOutOpen, "sceAudioOutOpen") &&
+	                   resolve(lib, sceAudioOutOutput, "sceAudioOutOutput");
+	if (old != 0) {
+		set_proc_authid(getpid(), old);
+	}
+	if (!found) {
+		wp_log("retro: sound: libSceAudioOut not found in the home screen (handle %d)", lib);
+		return nullptr;
+	}
+	wp_log("retro: sound: libSceAudioOut handle %d", lib);
+	const int init = sceAudioOutInit();
+	const int port = sceAudioOutOpen(0xff, 0, 0, 256, 48000, 1); // system user, main port, S16 stereo, 48 kHz
+	wp_log("retro: sound: init %#x, port %#x (in the home screen)", init, port);
+	if (port < 0) {
+		return nullptr;
+	}
+	constexpr unsigned kRing = 16384; // stereo frames (~0.34 s)
+	static int16_t     ring[kRing * 2];
+	static int16_t     grain[256 * 2];
+	static uint8_t     pkt[1 + 1024 * 4];
+	unsigned           w = 0, r = 0;
+	long               last_audio = 0;
+	for (;;) {
+		ssize_t n;
+		while ((n = recv(s, pkt, sizeof(pkt), MSG_DONTWAIT)) > 1) {
+			if (pkt[0] != 'A') {
+				continue;
+			}
+			const int16_t* smp    = reinterpret_cast<const int16_t*>(pkt + 1);
+			const unsigned frames = static_cast<unsigned>(n - 1) / 4;
+			for (unsigned i = 0; i < frames; ++i) {
+				if (w - r >= kRing) {
+					++r; // full: the oldest goes
+				}
+				ring[(w % kRing) * 2]     = smp[i * 2];
+				ring[(w % kRing) * 2 + 1] = smp[i * 2 + 1];
+				++w;
+			}
+			last_audio = now_ms();
+		}
+		// a little in hand before playing (no crackle at the start); paused / no game: silence
+		const bool play = g_mode.load() == 2 && now_ms() - last_audio < 200 && w - r >= 256;
+		for (int i = 0; i < 256; ++i) {
+			if (play && r != w) {
+				grain[i * 2]     = ring[(r % kRing) * 2];
+				grain[i * 2 + 1] = ring[(r % kRing) * 2 + 1];
+				++r;
+			} else {
+				grain[i * 2] = grain[i * 2 + 1] = 0;
+			}
+		}
+		if (g_mode.load() != 2) {
+			r = w; // nothing old plays when it goes on
+		}
+		if (sceAudioOutOutput(port, grain) < 0) { // waits for the previous grain: it sets the pace
+			usleep(5000);
+		}
+	}
+	return nullptr;
+}
+
+bool retro_setup() {
+	void* lib = nullptr;
+	(void)lib;
+	Obj core = open_image("/system_ex/common_ex/lib/Sce.PlayStation.Core.dll");
+	Obj pui  = open_image("/system_ex/common_ex/lib/Sce.PlayStation.PUI.dll");
+	Obj tk   = core != nullptr ? mono_class_from_name(core, "Sce.PlayStation.Core.Graphics", "Texture2D") : nullptr;
+	Obj ak   = pui != nullptr ? mono_class_from_name(pui, "Sce.PlayStation.PUI", "ImageAsset") : nullptr;
+	Obj bk   = pui != nullptr ? mono_class_from_name(pui, "Sce.PlayStation.PUI.UI3", "ImageBox") : nullptr;
+	if (tk == nullptr || ak == nullptr || bk == nullptr || mono_array_new == nullptr || mono_get_byte_class == nullptr) {
+		wp_log("retro: classes tex %p asset %p box %p, array_new %p", tk, ak, bk, reinterpret_cast<void*>(mono_array_new));
+		return false;
+	}
+	// texture: new Texture2D(160, 144, false, PixelFormat.Rgba)
+	Obj tex  = mono_object_new(g_domain, tk);
+	Obj tctr = mono_class_get_method_from_name(tk, ".ctor", 4);
+	int w = kRw, h = kRh, fmt = 1; // PixelFormat.Rgba
+	bool no = false;
+	void* targs[4] = {&w, &h, &no, &fmt};
+	if (tex == nullptr || tctr == nullptr || !invoke(tctr, tex, targs, "Texture2D(160,144,Rgba)")) {
+		return false;
+	}
+	g_rt_set = method_where(tk, "SetPixels", 2, 1, "System.Array");
+	g_rt_arr = mono_array_new(g_domain, mono_get_byte_class(), static_cast<uintptr_t>(kRw * kRh * 4));
+	// asset + image box on the wallpaper layer
+	Obj actr  = method_where(ak, ".ctor", 1, 0, "Texture");
+	Obj asset = mono_object_new(g_domain, ak);
+	void* aargs[1] = {tex};
+	if (g_rt_set == nullptr || g_rt_arr == nullptr || actr == nullptr || asset == nullptr || !invoke(actr, asset, aargs, "ImageAsset(Texture)")) {
+		wp_log("retro: SetPixels %p array %p asset ctor %p", g_rt_set, g_rt_arr, actr);
+		return false;
+	}
+	Obj box  = mono_object_new(g_domain, bk);
+	Obj bctr = mono_class_get_method_from_name(bk, ".ctor", 0);
+	if (box == nullptr || bctr == nullptr || !invoke(bctr, box, nullptr, "ImageBox()")) {
+		return false;
+	}
+	mono_gchandle_new(tex, 1);
+	mono_gchandle_new(g_rt_arr, 1);
+	mono_gchandle_new(asset, 1);
+	g_rt_pic[0]   = tex;
+	g_rt_asset[0] = asset;
+	for (int i = 1; i < kRtPics; ++i) { // the other pictures (if one cannot be made: fewer, as before)
+		Obj   t = mono_object_new(g_domain, tk);
+		Obj   a = t != nullptr ? mono_object_new(g_domain, ak) : nullptr;
+		void* ta[1] = {t};
+		if (a == nullptr || !invoke(tctr, t, targs, "Texture2D(more)") || !invoke(actr, a, ta, "ImageAsset(more)")) {
+			break;
+		}
+		mono_gchandle_new(t, 1);
+		mono_gchandle_new(a, 1);
+		g_rt_pic[i]   = t;
+		g_rt_asset[i] = a;
+		g_rt_npic     = i + 1;
+	}
+	wp_log("retro: %d pictures", g_rt_npic);
+	mono_gchandle_new(box, 1);
+	property_set(bk, box, "Image", asset);
+	// the wallpaper's own layers (the dim layer sits above the video; else the scene root / boot root)
+	Obj wk = g_ui3_widget != nullptr ? g_ui3_widget : mono_class_from_name(pui, "Sce.PlayStation.PUI.UI3", "Widget");
+	Obj vparent = g_own_view != nullptr ? property_get(wk, g_own_view, "Parent") : nullptr; // right above the video
+	Obj parent  = vparent != nullptr ? vparent : g_dim_root != nullptr ? g_dim_root : g_scene_root != nullptr ? g_scene_root : g_boot_root;
+	float x = 1550.0f, y = 740.0f, bw = 320.0f, bh = 288.0f; // the mini screen: bottom right, 2x (the game paused)
+	property_set(wk, box, "X", &x);
+	property_set(wk, box, "Y", &y);
+	property_set(wk, box, "Width", &bw);
+	property_set(wk, box, "Height", &bh);
+	void* cargs[1] = {box};
+	(void)cargs;
+	// the menu and the pop-up go on the home screen's own scene (not the wallpaper's layer): PlayShell works with
+	// the wallpaper off too
+	const bool ok = parent != nullptr || home_scene_root(pui) != nullptr;
+	wp_log("retro: parent %s (dim %p scene %p boot %p)", parent == nullptr ? "none (wallpaper off: the home screen's scene)" : parent == vparent ? "the video's layer" : parent == g_dim_root ? "dim layer" : parent == g_scene_root ? "scene root" : "boot root",
+	       g_dim_root, g_scene_root, g_boot_root);
+	g_rt_tex = ok ? tex : nullptr; // not ready: retro_tick tries again in 5 s
+	g_rt_box = box;
+	wp_log("retro: PlayShell %s", ok ? "ready" : "NOT ready (no home screen scene yet: tried again later)");
+	pthread_t rt, st;
+	if (ok && pthread_create(&rt, nullptr, retro_rx_thread, nullptr) == 0) {
+		pthread_detach(rt);
+	}
+	if (ok && pthread_create(&st, nullptr, retro_sound_thread, nullptr) == 0) {
+		pthread_detach(st);
+	}
+	if (ok) {
+		retro_popup_setup(pui, asset, wk);
+		retro_menu_setup(pui, wk);
+		detour_method("Sce.PlayStation.Core", "GamePad", "GetData", 1, reinterpret_cast<void*>(&GetData_Hook),
+		              reinterpret_cast<void**>(&g_getdata_orig));
+	}
+	return ok;
+}
+
+// Every frame: a moving pattern (scrolling colour bars + a bouncing white square) into the texture.
+void retro_tick() {
+	if (g_rt_fail > 3) {
+		return;
+	}
+	if (g_rt_tex == nullptr) {
+		if (g_rt_start == 0) {
+			g_rt_start = g_tick + 240; // ~4 s after the module started (the wallpaper's video is up)
+		}
+		if (g_tick >= g_rt_start && !retro_setup()) {
+			++g_rt_fail;
+			g_rt_start = g_tick + 300;
+		}
+		return;
+	}
+	g_game_mode = g_mode.load() == 2;
+	retro_menu_tick();
+	retro_popup_tick(g_game_mode);
+	static uint32_t shown = 0;
+	const uint32_t  ready = g_rf_ready.load();
+	if (ready == 0 || ready == shown) {
+		return; // no new frame from the payload yet
+	}
+	shown = ready;
+	// one whole frame: copied again if the receiver wrote a new one meanwhile (a torn frame flickered at the top)
+	static uint16_t frame[kRw * kRh];
+	for (int tries = 0; tries < 4; ++tries) {
+		const uint32_t a = g_rf_seq.load();
+		if (a & 1) {
+			continue;
+		}
+		memcpy(frame, g_rf, sizeof(frame));
+		if (g_rf_seq.load() == a) {
+			break;
+		}
+	}
+	static int on = 0, pending = -1;
+	if (pending >= 0 && g_pop_img != nullptr) { // the frame written last refresh goes on screen now
+		prop_set_up(g_pop_img, "Image", g_rt_asset[pending]);
+		on      = pending;
+		pending = -1;
+	}
+	const int w   = (on + 1) % g_rt_npic; // the picture not on screen
+	Obj       arr = g_rt_arr;
+	uint8_t*  px  = reinterpret_cast<uint8_t*>(static_cast<char*>(arr) + 32); // MonoArray data (64-bit)
+	for (int i = 0; i < kRw * kRh; ++i) { // RGB565 -> RGBA
+		const uint16_t v = frame[i];
+		const int      r = v >> 11, g = (v >> 5) & 63, b = v & 31;
+		px[i * 4]     = static_cast<uint8_t>((r << 3) | (r >> 2));
+		px[i * 4 + 1] = static_cast<uint8_t>((g << 2) | (g >> 4));
+		px[i * 4 + 2] = static_cast<uint8_t>((b << 3) | (b >> 2));
+		px[i * 4 + 3] = 255;
+	}
+	const long t = now_ms();
+	struct timespec a {}, b {};
+	clock_gettime(CLOCK_MONOTONIC, &a);
+	int        level   = 0;
+	void*      args[2] = {&level, arr};
+	Obj        exc     = nullptr;
+	// two pictures: the frame goes into the one not on screen; it is shown at the NEXT refresh (its upload to the
+	// graphics chip is done by then - shown at once, the top rows were sometimes new and the rest old: a flicker
+	// at the top while things moved)
+	mono_runtime_invoke(g_rt_set, g_rt_pic[w], args, &exc);
+	if (exc == nullptr && g_rt_npic > 1) {
+		pending = w;
+	}
+	clock_gettime(CLOCK_MONOTONIC, &b);
+	if (exc != nullptr) {
+		log_exception("Texture2D.SetPixels", exc);
+		g_rt_fail = 99;
+		return;
+	}
+	g_rt_us += (b.tv_sec - a.tv_sec) * 1000000L + (b.tv_nsec - a.tv_nsec) / 1000;
+	++g_rt_n;
+	if (g_rt_t0 == 0) {
+		g_rt_t0 = t;
+	} else if (t - g_rt_t0 >= 2000) {
+		static int logs = 0;
+		if (logs++ < 30) {
+			wp_log("retro: %ld frames in %ld ms (%.1f fps), SetPixels %ld us avg", g_rt_n, t - g_rt_t0, g_rt_n * 1000.0 / (t - g_rt_t0),
+			       g_rt_us / g_rt_n);
+		}
+		g_rt_t0 = t, g_rt_n = 0, g_rt_us = 0;
+	}
+}
+#endif
+
 void v11_setup() {
 	detour_method("Sce.Vsh.ShellUI.BGLayer", "BGLayerPlugin", "SetBackgroundTransition", 1,
 	              reinterpret_cast<void*>(&SetBg_Hook), reinterpret_cast<void**>(&g_setbg_orig));
@@ -2906,11 +4106,14 @@ void* guard_thread(void*) {
 
 bool choose_video() {
 	g_video_path[0] = 0;
-	FILE* f = fopen(kPathFile, "r");
+	FILE*       f      = fopen(kPathFile, "r");
+	const int   ferr   = errno;
+	char        got[48] = "";
 	if (f != nullptr) {
 		char line[512] = {};
 		if (fgets(line, sizeof(line), f) != nullptr) {
 			line[strcspn(line, "\r\n")] = 0;
+			snprintf(got, sizeof(got), "%s", line);
 			if (line[0] == '/') {
 				snprintf(g_video_path, sizeof(g_video_path), "%s", line);
 			}
@@ -2923,7 +4126,11 @@ bool choose_video() {
 		fclose(f);
 	}
 	if (g_video_path[0] == 0) {
-		wp_log("video: no path in %s", kPathFile);
+		if (f == nullptr) {
+			wp_log("video: no path in %s (cannot open it: errno %d)", kPathFile, ferr);
+		} else {
+			wp_log("video: no path in %s (it says '%s')", kPathFile, got);
+		}
 		return false;
 	}
 	struct stat st {};
@@ -2954,7 +4161,380 @@ bool video_active() {
 
 // Stop the current clip. Called on the UI thread only. The player itself is not disposed here:
 // the view owns it, and a second Dispose on it is not known to be safe.
+// ---- kept players (v1.7.0) --------------------------------------------------------------------
+// A tile swap used to destroy the clip's player and build a new one every time. Now the player you leave is
+// KEPT: paused, hidden (opacity 0), muted - and coming back to that clip just plays it again (~70 ms, 4K
+// ~0.15 s; the decoder probe showed 6 FullHD + 3 UHD extra players alive with no limit). Up to kParkMax are
+// kept, the oldest go first; the newest 4K one is kept over older 1080p ones: while one 4K player lives, the
+// decoder stays in 4K mode and a NEW 4K clip starts in ~0.2 s instead of ~1.1 s. The black fade of a swap is
+// untouched: only "destroy + build" became "keep + reuse". Every other stop (a game, off, the window, a
+// restart) frees them all: a game needs the memory, and the PS5 refuses 4K next to a running game anyway.
+// The 4K warm-up: with a 4K clip for some game and no 4K player alive, one is made hidden and paused in a
+// calm moment, so even the FIRST 4K tile starts fast.
+struct Parked {
+	Obj  view = nullptr, player = nullptr;
+	char path[512] {};
+	bool uhd  = false;
+	int  used = 0;
+};
+constexpr int kParkMax = 6; // user 2026-11-10 (was 5)
+Parked        g_parked[kParkMax];
+int           g_last_swap  = 0;     // tick of the last swap (the warm-up waits for a calm moment)
+Parked        g_warm;               // a 4K player being made hidden (moves -> paused -> kept)
+long          g_warm_t0    = 0;
+int           g_warm_fails = 0;
+char          g_warm_bad[512] {};   // a 4K clip that would not play hidden: not tried again
+
+Obj widget_cls() {
+	static Obj w = nullptr;
+	if (w == nullptr) {
+		Obj pui = open_image("/system_ex/common_ex/lib/Sce.PlayStation.PUI.dll");
+		w       = pui != nullptr ? mono_class_from_name(pui, "Sce.PlayStation.PUI.UI3", "Widget") : nullptr;
+	}
+	return w;
+}
+
+// "free 412 MB, heap 96 MB": ShellUI's free memory and the home screen's object heap - over a long session
+// these must stay flat (kept players are not a leak). "?" = the PS5 did not give that number.
+const char* mem_note() {
+	static char note[80];
+	size_t      flex = 0;
+	const bool  f    = sceKernelAvailableFlexibleMemorySize != nullptr && sceKernelAvailableFlexibleMemorySize(&flex) == 0;
+	const long long heap = mono_gc_get_heap_size != nullptr ? static_cast<long long>(mono_gc_get_heap_size()) : -1;
+	const long long used = mono_gc_get_used_size != nullptr ? static_cast<long long>(mono_gc_get_used_size()) : -1;
+	char a[24], b[24], c[24];
+	snprintf(a, sizeof(a), f ? "%zu MB" : "?", flex >> 20);
+	snprintf(b, sizeof(b), heap >= 0 ? "%lld MB" : "?", heap >> 20);
+	snprintf(c, sizeof(c), used >= 0 ? "%lld MB" : "?", used >> 20);
+	snprintf(note, sizeof(note), "free %s, heap used %s of %s", a, c, b);
+	return note;
+}
+
+int kept_count() {
+	int n = 0;
+	for (const Parked& p : g_parked) {
+		n += p.view != nullptr ? 1 : 0;
+	}
+	return n;
+}
+
+long park_ms() {
+	timespec t {};
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return static_cast<long>(t.tv_sec) * 1000 + t.tv_nsec / 1000000;
+}
+
+void player_call(Obj player, Obj view, const char* name) { // Pause / Play: the player's own, else the view's
+	Obj m = player != nullptr ? find_method_up(mono_object_get_class(player), name, 0) : nullptr;
+	if (m == nullptr || !invoke(m, player, nullptr, name)) {
+		invoke(find_method_up(g_videoview_class, name, 0), view, nullptr, name);
+	}
+}
+
+void hide_player(Obj view, Obj player) {
+	float zero = 0.0f;
+	bool  yes  = true;
+	set_blend(view, false); // an "overwrite" view must not draw at opacity 0
+	property_set(widget_cls(), view, "Opacity", &zero);
+	player_call(player, view, "Pause");
+	if (player != nullptr) {
+		void* m[1] = {&yes};
+		invoke(mono_class_get_method_from_name(mono_object_get_class(player), "SetIsMuted", 1), player, m, "SetIsMuted (kept)");
+		set_bgm_suppression(mono_object_get_class(player), player, false); // a kept clip never holds the PS5's music
+	}
+}
+
+void free_parked(const char* why) {
+	int n = 0;
+	for (Parked& p : g_parked) {
+		if (p.view != nullptr) {
+			dispose_view(p.view);
+			++n;
+		}
+		p = Parked();
+	}
+	if (g_warm.view != nullptr) {
+		dispose_view(g_warm.view);
+		g_warm = Parked();
+		++n;
+	}
+	if (n > 0) {
+		wp_log("kept players: %d freed (%s)", n, why);
+	}
+}
+
+bool any_uhd_alive() {
+	if (g_own_view != nullptr && g_play_uhd) {
+		return true;
+	}
+	for (const Parked& p : g_parked) {
+		if (p.view != nullptr && p.uhd) {
+			return true;
+		}
+	}
+	return g_warm.view != nullptr;
+}
+
+// Room for one more: the oldest goes, but the newest 4K one stays (it keeps the decoder in 4K mode).
+Parked* park_slot() {
+	Parked* best      = nullptr;
+	int     uhd_count = 0, newest_uhd = -1;
+	for (Parked& p : g_parked) {
+		if (p.view == nullptr) {
+			return &p;
+		}
+		if (p.uhd) {
+			++uhd_count;
+			newest_uhd = std::max(newest_uhd, p.used);
+		}
+	}
+	for (Parked& p : g_parked) {
+		if (p.uhd && p.used == newest_uhd) {
+			continue;
+		}
+		if (best == nullptr || p.used < best->used) {
+			best = &p;
+		}
+	}
+	if (best == nullptr) {
+		best = &g_parked[0];
+	}
+	dispose_view(best->view);
+	*best = Parked();
+	return best;
+}
+
+void keep_player(Obj view, Obj player, const char* path, bool uhd) {
+	for (Parked& p : g_parked) { // the same clip kept twice: the older one goes
+		if (p.view != nullptr && strcmp(p.path, path) == 0) {
+			dispose_view(p.view);
+			p = Parked();
+		}
+	}
+	Parked* s = park_slot();
+	s->view   = view;
+	s->player = player;
+	s->uhd    = uhd;
+	s->used   = g_tick;
+	snprintf(s->path, sizeof(s->path), "%s", path);
+}
+
+// The swap's "stop": the clip you leave is kept instead of destroyed. false = nothing to keep (stop_video then).
+bool park_current() {
+	g_last_swap = g_tick;
+	if (g_own_view == nullptr || g_boot_player != nullptr || g_old_view != nullptr || g_stopping || game_alive()) {
+		return false;
+	}
+	Obj view = g_own_view, player = g_own_player;
+	g_own_view = g_own_player = nullptr; // own_player_report stops touching it
+	const char* cur = g_play_path[0] != 0 ? g_play_path : g_video_path;
+	Obj         d   = g_videoview_class != nullptr ? property_get(g_videoview_class, view, "Duration") : nullptr;
+	const bool  opened = d != nullptr && *static_cast<unsigned long long*>(mono_object_unbox(d)) > 0;
+	if (strcmp(cur, g_switch_path) == 0 || !opened) {
+		// a restart of the SAME clip (the watchdog) or a player that never opened: keeping it would hand the
+		// broken player straight back - it goes, the clip starts fresh
+		dispose_view(view);
+		g_own_frames = g_own_logs = g_own_restarts = 0;
+		g_own_loop_set = false;
+		wp_log("not kept: %s (%s)", cur, opened ? "the same clip starts fresh" : "it never opened");
+		return true;
+	}
+	hide_player(view, player);
+	keep_player(view, player, g_play_path[0] != 0 ? g_play_path : g_video_path, g_play_uhd);
+	g_own_frames = g_own_logs = g_own_restarts = 0;
+	g_own_loop_set = false;
+	wp_log("kept: %s%s", g_play_path[0] != 0 ? g_play_path : g_video_path, g_play_uhd ? " (4K)" : "");
+	return true;
+}
+
+// start_own_player: a kept player of this clip plays again instead of a new one. true = it is the wallpaper now.
+bool unpark(const char* path, Obj player_class, Obj view_class) {
+	Parked* found = nullptr;
+	for (Parked& p : g_parked) {
+		if (p.view != nullptr && strcmp(p.path, path) == 0) {
+			found = &p;
+		}
+	}
+	if (found == nullptr) {
+		return false;
+	}
+	const long t0 = park_ms();
+	Obj view = found->view, player = found->player;
+	*found = Parked();
+	float zero = 0.0f;
+	property_set(widget_cls(), view, "Opacity", &zero); // focus_tick fades it in, as a new one
+	g_clip_silent = clip_is_silent(path);
+	set_bgm_suppression(player_class, player, g_vol_req.load() == 0 || g_clip_silent);
+	g_aud_now = 0.0f;
+	assert_sound(player_class, player);
+	player_call(player, view, "Play"); // from the start, as every clip starts
+	assert_sound(player_class, player); // Play reset it
+	g_own_player    = player;
+	g_own_view      = view;
+	g_own_play0     = method_by_desc(view_class, ":Play(ulong)");
+	g_vplayer_class = player_class;
+	wp_log("own player: kept one plays again: %s (%ld ms)", path, park_ms() - t0);
+	return true;
+}
+
+// The 4K warm-up. Hidden + muted, built like start_own_player's 4K one; once it moves it is paused and kept.
+bool warm_make(const char* path, const char* name) {
+	Obj pui   = open_image("/system_ex/common_ex/lib/Sce.PlayStation.PUI.dll");
+	Obj video = open_image("/system_ex/common_ex/lib/Sce.Vsh.VideoPlayer.dll");
+	Obj view_class   = pui != nullptr ? mono_class_from_name(pui, "Sce.PlayStation.PUI.UI3", "VideoView") : nullptr;
+	Obj option_class = pui != nullptr ? mono_class_from_name(pui, "Sce.PlayStation.PUI.UI3", "VideoView/PlayOptionParam") : nullptr;
+	Obj player_class = video != nullptr ? mono_class_from_name(video, "Sce.Vsh.Video", "VideoPlayer") : nullptr;
+	Obj create_class = video != nullptr ? mono_class_from_name(video, "Sce.Vsh.Video", "VideoPlayer/CreateOptionParam") : nullptr;
+	Obj widget_class = pui != nullptr ? mono_class_from_name(pui, "Sce.PlayStation.PUI.UI3", "Widget") : nullptr;
+	Obj scene_class  = pui != nullptr ? mono_class_from_name(pui, "Sce.PlayStation.PUI.UI3", "Scene") : nullptr;
+	if (view_class == nullptr || option_class == nullptr || player_class == nullptr || create_class == nullptr || widget_class == nullptr ||
+	    scene_class == nullptr) {
+		return false;
+	}
+	Obj create_opt = construct_pinned(create_class, mono_class_get_method_from_name(create_class, ".ctor", 0), nullptr, "warm CreateOptionParam()");
+	if (create_opt == nullptr) {
+		return false;
+	}
+	char address[400];
+	int  at = snprintf(address, sizeof(address), "http://127.0.0.1:9050/uhd/");
+	for (const char* c = name; *c != 0 && at < static_cast<int>(sizeof(address)) - 4; ++c) {
+		const unsigned char u = static_cast<unsigned char>(*c);
+		at += isalnum(u) || u == '-' || u == '_' || u == '.' ? snprintf(address + at, 2, "%c", u) : snprintf(address + at, 4, "%%%02X", u);
+	}
+	int mode = 1, fb = 1, res = 4; // Playback, 1920x1080 output, UHD decoder
+	set_option_field(create_class, create_opt, "uri", mono_string_new(g_domain, address));
+	set_option_field(create_class, create_opt, "createMode", &mode);
+	set_option_field(create_class, create_opt, "frameBufferSize", &fb);
+	set_option_field(create_class, create_opt, "coreResourceType", &res);
+	void* pa[1]     = {create_opt};
+	Obj   player    = construct_pinned(player_class, method_by_desc(player_class, ":.ctor(Sce.Vsh.Video.VideoPlayer/CreateOptionParam)"), pa, "warm VideoPlayer");
+	Obj   option    = player != nullptr ? construct_pinned(option_class, mono_class_get_method_from_name(option_class, ".ctor", 0), nullptr, "warm PlayOptionParam") : nullptr;
+	void* va[1]     = {option};
+	Obj   view      = option != nullptr ? construct_pinned(view_class, method_by_desc(view_class, ":.ctor(Sce.PlayStation.PUI.UI3.VideoView/PlayOptionParam)"), va, "warm VideoView") : nullptr;
+	if (view == nullptr) {
+		return false;
+	}
+	float zero = 0.0f, width = 1920.0f, height = 1080.0f;
+	property_set(widget_class, view, "X", &zero);
+	property_set(widget_class, view, "Y", &zero);
+	property_set(widget_class, view, "Width", &width);
+	property_set(widget_class, view, "Height", &height);
+	property_set(widget_class, view, "Opacity", &zero);
+	set_blend(view, false);
+	bool  yes   = true;
+	void* sp[2] = {player, &yes};
+	Obj   root  = property_get(scene_class, g_plugin, "RootWidget");
+	void* ca[1] = {view};
+	if (!invoke(mono_class_get_method_from_name(view_class, "SetPlayer", 2), view, sp, "warm SetPlayer") || root == nullptr ||
+	    !invoke(mono_class_get_method_from_name(widget_class, "AppendChild", 1), root, ca, "warm AppendChild")) {
+		dispose_view(view);
+		return false;
+	}
+	set_bgm_suppression(player_class, player, false);
+	void* m[1] = {&yes};
+	invoke(mono_class_get_method_from_name(player_class, "SetIsMuted", 1), player, m, "warm SetIsMuted");
+	invoke(mono_class_get_method_from_name(player_class, "Init", 1), player, m, "warm Init");
+	invoke(mono_class_get_method_from_name(view_class, "Play", 0), view, nullptr, "warm Play");
+	invoke(mono_class_get_method_from_name(player_class, "SetIsMuted", 1), player, m, "warm SetIsMuted");
+	invoke(mono_class_get_method_from_name(player_class, "SetLoop", 1), player, m, "warm SetLoop");
+	g_warm.view   = view;
+	g_warm.player = player;
+	g_warm.uhd    = true;
+	snprintf(g_warm.path, sizeof(g_warm.path), "%s", path);
+	return true;
+}
+
+// Once a second: free everything while a game is in front; warm a 4K player in a calm moment.
+void park_tick() {
+	if (g_tick % 60 != 30) {
+		return;
+	}
+	if (game_alive()) {
+		free_parked("a game is open");
+		return;
+	}
+	for (Parked& p : g_parked) { // unused for 10 min: let it go (the 4K warm-up makes a new one when needed)
+		if (p.view != nullptr && g_tick - p.used > 10 * 60 * 60) {
+			wp_log("kept: %s unused for 10 min, freed", p.path);
+			dispose_view(p.view);
+			p = Parked();
+		}
+	}
+	if (g_warm.view != nullptr) { // being made: does it move?
+		Obj            p   = g_videoview_class != nullptr ? property_get(g_videoview_class, g_warm.view, "Position") : nullptr;
+		const uint64_t pos = p != nullptr ? *static_cast<uint64_t*>(mono_object_unbox(p)) : 0;
+		if (pos > 0) {
+			hide_player(g_warm.view, g_warm.player);
+			wp_log("4k warm-up: %s ready after %ld ms (kept, paused)", g_warm.path, park_ms() - g_warm_t0);
+			keep_player(g_warm.view, g_warm.player, g_warm.path, true);
+			g_warm = Parked();
+		} else if (park_ms() - g_warm_t0 > 10000) {
+			wp_log("4k warm-up: %s did not play hidden - not tried again", g_warm.path);
+			snprintf(g_warm_bad, sizeof(g_warm_bad), "%s", g_warm.path);
+			dispose_view(g_warm.view);
+			g_warm = Parked();
+			++g_warm_fails;
+		}
+		return;
+	}
+	// calm: playing, no swap for 3 s, not black, not stopping, nothing 4K alive, few failures
+	if (g_warm_fails >= 3 || g_stopping || g_switch_at >= 0 || g_hold_black || g_tick - g_last_swap < 180 || // also when nothing plays (Videos per game only)
+	    any_uhd_alive() || g_videoview_class == nullptr) {
+		return;
+	}
+	// a 4K clip some game uses (fast.txt: "TITLE=<clip>" lines, "^<clip>\t<name>\t" = 4K)
+	FILE* f = fopen("/system_tmp/liveshell/fast.txt", "r");
+	if (f == nullptr) {
+		return;
+	}
+	char line[700], name[256] = {}, pick[512] = {};
+	static char games[160][512]; // every game with a clip (was 8: the 4K ones came later and were never seen)
+	int  ng = 0;
+	static char uhd[64][2][256];
+	int  nu = 0;
+	while (fgets(line, sizeof(line), f) != nullptr) {
+		line[strcspn(line, "\r\n")] = 0;
+		char* eq = strchr(line, '=');
+		if (line[0] == '^' && nu < 64) {
+			char* t1 = strchr(line, '\t');
+			if (t1 != nullptr) {
+				*t1      = 0;
+				char* t2 = strchr(t1 + 1, '\t');
+				if (t2 != nullptr) {
+					*t2 = 0;
+				}
+				snprintf(uhd[nu][0], sizeof(uhd[nu][0]), "%s", line + 1);
+				snprintf(uhd[nu][1], sizeof(uhd[nu][1]), "%s", t1 + 1);
+				++nu;
+			}
+		} else if (eq != nullptr && line[0] != '*' && ng < 160) {
+			snprintf(games[ng++], sizeof(games[0]), "%s", eq + 1);
+		}
+	}
+	fclose(f);
+	for (int g = 0; g < ng && pick[0] == 0; ++g) {
+		for (int u = 0; u < nu; ++u) {
+			if (strcmp(games[g], uhd[u][0]) == 0 && strcmp(games[g], g_warm_bad) != 0) {
+				snprintf(pick, sizeof(pick), "%s", uhd[u][0]);
+				snprintf(name, sizeof(name), "%s", uhd[u][1]);
+				break;
+			}
+		}
+	}
+	if (pick[0] == 0) {
+		return; // no game has a 4K clip: nothing to warm
+	}
+	g_warm_t0 = park_ms();
+	if (warm_make(pick, name)) {
+		wp_log("4k warm-up: making %s hidden", pick);
+	} else {
+		wp_log("4k warm-up: %s could not be made", pick);
+		++g_warm_fails;
+	}
+}
+
 void stop_video() {
+	free_parked("stop");
 	if (g_old_view != nullptr) { // a cross-fade was running: the old clip goes too
 		dispose_view(g_old_view);
 		g_old_view = g_old_player = nullptr;
@@ -3261,6 +4841,7 @@ void Update_Hook(Obj self) {
 		handle_requests();
 		focus_sound_tick();
 		fast_tick();
+		park_tick();
 		sysbgm_tick();
 		stall_tick();
 		sound_tick();
@@ -3269,6 +4850,10 @@ void Update_Hook(Obj self) {
 		if (true) { // every frame: the menu fade needs it (just a static field read)
 			focus_tick();
 			parallax_tick();
+			avatar_tick();
+#ifdef LIVESHELL_RESEARCH_RETRO
+			retro_tick();
+#endif
 			launchfx_tick();
 		}
 	}
@@ -3316,6 +4901,799 @@ void read_request_line(char* out, size_t size) {
 	fclose(f);
 }
 
+#ifdef LIVESHELL_RESEARCH_DUMP
+// RESEARCH BUILD ONLY (animated avatars, v1.6.0): every loaded assembly's image (MonoImage raw_data, the
+// decrypted IL the runtime reads) goes to the payload over UDP 127.0.0.1:9052, which writes
+// /data/LiveShell/dump/<name>.dll, for reading on a PC. Not in normal builds.
+int g_dump_sock = -1;
+
+void dump_image(void* assembly, void*) {
+	Obj         image = mono_assembly_get_image(static_cast<Obj>(assembly));
+	const char* name  = image != nullptr && mono_image_get_name != nullptr ? mono_image_get_name(image) : nullptr;
+	if (name == nullptr) {
+		return;
+	}
+	const uint8_t* raw = *reinterpret_cast<const uint8_t* const*>(static_cast<const char*>(image) + 16);
+	const uint32_t len = *reinterpret_cast<const uint32_t*>(static_cast<const char*>(image) + 24);
+	if (raw == nullptr || len < 512 || len > (64u << 20) || raw[0] != 'M' || raw[1] != 'Z') {
+		wp_log("dump: %s: no image (raw %p, len %u)", name, raw, len);
+		return;
+	}
+	sockaddr_in a {};
+	a.sin_family      = AF_INET;
+	a.sin_port        = htons(9052);
+	a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	static char pkt[64 + 8 + 8192]; // FreeBSD: a UDP datagram is at most ~9 KB (net.inet.udp.maxdgram)
+	for (uint32_t off = 0; off < len; off += 8192) {
+		const uint32_t n = len - off < 8192 ? len - off : 8192;
+		memset(pkt, 0, 64);
+		snprintf(pkt, 64, "%s", name);
+		memcpy(pkt + 64, &off, 4);
+		memcpy(pkt + 68, &len, 4);
+		memcpy(pkt + 72, raw + off, n);
+		for (int t = 0; t < 50 && sendto(g_dump_sock, pkt, 72 + n, 0, reinterpret_cast<sockaddr*>(&a), sizeof(a)) < 0; ++t) {
+			usleep(20 * 1000);
+		}
+		usleep(1500);
+	}
+	wp_log("dump: %s %u bytes sent", name, len);
+}
+
+void* dump_thread(void*) {
+	mono_thread_attach(g_domain);
+	sleep(25); // the home screen loads its assemblies first
+	g_dump_sock = socket(AF_INET, SOCK_DGRAM, 0);
+	if (g_dump_sock < 0 || mono_assembly_foreach == nullptr) {
+		wp_log("dump: not possible (socket %d, foreach %p)", g_dump_sock, reinterpret_cast<void*>(mono_assembly_foreach));
+		return nullptr;
+	}
+	for (int round = 0; round < 2; ++round) { // twice: assemblies loaded later (a second pass sends them too)
+		mono_assembly_foreach(dump_image, nullptr);
+		wp_log("dump: round %d done", round + 1);
+		sleep(60);
+	}
+	return nullptr;
+}
+#endif
+
+
+// ---- animated avatars (v1.6.0) --------------------------------------------------------------
+// The home screen loads every avatar as "profilecache:image/face/default?userid=<id>&size=<ss|m|..>" through
+// ImageAsset.LoadAsync(uri, action, option), from React Native's image views (set_Source) and PUI image boxes
+// (ImageBox.LoadAsync). From the start every image box that loads an avatar is remembered with its address.
+// A user with /data/LiveShell/video/.avatars/<id>.png (ShellUI sees that folder as
+// /system_ex/vsh_asset/wallpaper/.avatars) gets that picture instead, decoded as an animated PNG
+// (ImageOptions.IsAnimatedImage; the image box loops it). When the file appears or changes, a hidden image box
+// decodes it (a fraction of a second) and then every remembered avatar of that user switches at once; when it
+// goes, they all load Sony's again. Until a new one is decoded, new loads get <id>_still.png (its first
+// picture). Users without one: nothing changes (the hooks only note which boxes show avatars).
+// Avatars already on screen before that (loaded before LiveShell watched: at its start, or the login screen
+// after rest mode) are found by walking every scene's widgets (SceneManager.Instance.SceneLayers ->
+// RootWidget -> FirstChildBase / NextSiblingBase): at the start, now and then, and when an avatar changes.
+// "?ts=<time>" (as Sony does for game icons): a new file is not taken from the image cache.
+constexpr const char* kAvatarDir = "/system_ex/vsh_asset/wallpaper/.avatars";
+using AssetLoadFn = Obj (*)(Obj uri, Obj action, Obj option);
+using SetSourceFn = void (*)(Obj self, Obj source);
+using BoxLoadFn   = void (*)(Obj self, Obj uri, Obj action, Obj option, bool set_image);
+AssetLoadFn      g_assetload_orig = nullptr;
+SetSourceFn      g_setsrc_orig    = nullptr;
+BoxLoadFn        g_boxload2_orig = nullptr, g_boxload3_orig = nullptr;
+thread_local Obj g_loading_view   = nullptr; // the image box whose load is running
+Obj              g_opt_class      = nullptr;
+bool             g_avatar_hooked  = false;
+
+struct AvatarView {
+	Obj  view = nullptr;
+	char uri[160] {}; // Sony's address for it (loaded again when the animated avatar goes)
+};
+
+struct Avatar {
+	long       user   = 0;
+	long       mtime  = 0;       // of <id>.png shown now (0: Sony's avatar)
+	long       want   = 0;       // of <id>.png being decoded
+	Obj        box    = nullptr; // hidden ImageBox decoding it
+	int        since  = 0;
+	AvatarView views[16] {};
+	int        nviews = 0;
+};
+Avatar g_avatars[8];
+
+// A System.String's text as ASCII (no allocation: called for every picture the home screen loads).
+size_t mono_ascii(Obj str, char* out, size_t cap) {
+	const int32_t   len = *reinterpret_cast<const int32_t*>(static_cast<const char*>(str) + 16);
+	const uint16_t* ch  = reinterpret_cast<const uint16_t*>(static_cast<const char*>(str) + 20);
+	size_t          n   = 0;
+	for (int32_t i = 0; i < len && n + 1 < cap; ++i) {
+		out[n++] = ch[i] < 0x80 ? static_cast<char>(ch[i]) : '?';
+	}
+	out[n] = 0;
+	return n;
+}
+
+// ImageOptions set to decode an animated PNG: a copy of Sony's (it may be shared by other pictures) or new.
+Obj anim_option(Obj option) {
+	if (g_opt_class == nullptr) {
+		g_opt_class = find_class("Sce.PlayStation.PUI", "ImageOptions");
+	}
+	if (g_opt_class == nullptr) {
+		return nullptr;
+	}
+	Obj opt = nullptr;
+	if (option != nullptr) {
+		Obj clone = mono_class_get_method_from_name(mono_object_get_class(option), "Clone", 0);
+		if (clone == nullptr || !invoke(clone, option, nullptr, "ImageOptions.Clone", &opt)) {
+			opt = nullptr;
+		}
+	}
+	if (opt == nullptr) {
+		opt      = mono_object_new(g_domain, g_opt_class);
+		Obj ctor = mono_class_get_method_from_name(g_opt_class, ".ctor", 0);
+		if (opt == nullptr || ctor == nullptr || !invoke(ctor, opt, nullptr, "ImageOptions()")) {
+			return nullptr;
+		}
+	}
+	bool yes  = true;
+	int  mode = 2; // ImageAnimationDecodeMode.ProgressiveDecode
+	property_set(g_opt_class, opt, "IsAnimatedImage", &yes);
+	property_set(g_opt_class, opt, "AnimationDecodeMode", &mode);
+	return opt;
+}
+
+// The user's animated avatar: 0 = none, else its file time; uri = the still or the animation.
+long avatar_uri(long user, bool still, char* uri, size_t cap) {
+	char        path[128];
+	struct stat st {};
+	snprintf(path, sizeof(path), "%s/%ld.png", kAvatarDir, user);
+	if (user <= 0 || stat(path, &st) != 0 || st.st_size <= 64) {
+		return 0;
+	}
+	const long t = static_cast<long>(st.st_mtime);
+	snprintf(path, sizeof(path), "%s/%ld%s.png", kAvatarDir, user, still ? "_still" : "");
+	snprintf(uri, cap, "%s?ts=%ld", path, t);
+	return t;
+}
+
+Avatar* avatar_of(long user) {
+	for (Avatar& a : g_avatars) {
+		if (a.user == user) {
+			return &a;
+		}
+	}
+	for (Avatar& a : g_avatars) {
+		if (a.user == 0) {
+			a.user = user;
+			return &a;
+		}
+	}
+	return nullptr;
+}
+
+// The user an avatar address belongs to: "profilecache:image/face/...?userid=<id>" (what is loaded) or the
+// profile cache's own file ".../profile/0x<id in hex>/avatar...", which a box shown before may hold; else 0.
+long face_user(const char* text) {
+	const char* face = strstr(text, "profilecache:image/face/");
+	const char* id   = face != nullptr ? strstr(face, "userid=") : nullptr;
+	if (id != nullptr) {
+		return strtol(id + 7, nullptr, 10);
+	}
+	const char* dir = strstr(text, "/profile/0x");
+	if (dir != nullptr && strstr(dir, "/avatar") != nullptr) {
+		return strtol(dir + 9, nullptr, 16);
+	}
+	return 0;
+}
+
+void remember_view(Avatar& a, Obj view, const char* uri) {
+	for (int i = 0; i < a.nviews; ++i) {
+		if (a.views[i].view == view) {
+			snprintf(a.views[i].uri, sizeof(a.views[i].uri), "%s", uri);
+			return;
+		}
+	}
+	mono_gchandle_new(view, 1);
+	AvatarView& v = a.views[a.nviews < 16 ? a.nviews++ : (g_tick % 16)];
+	v.view        = view;
+	snprintf(v.uri, sizeof(v.uri), "%s", uri);
+}
+
+// view.LoadAsync(uri, null, option, true); without an option: view.LoadAsync(uri) (Sony's own defaults)
+bool view_load(Obj view, const char* uri, Obj opt) {
+	const int argc = opt != nullptr ? 4 : 1;
+	Obj       load = nullptr;
+	for (Obj k = mono_object_get_class(view); k != nullptr && load == nullptr; k = mono_class_get_parent(k)) {
+		load = mono_class_get_method_from_name(k, "LoadAsync", argc);
+	}
+	bool  yes     = true;
+	void* args[4] = {mono_string_new(g_domain, uri), nullptr, opt, &yes};
+	return load != nullptr && invoke(load, view, args, "ImageBox.LoadAsync");
+}
+
+// Show a remembered avatar view again. React Native's image view (the round, masked avatar) sets its picture
+// again from a copy of its own Source (same address: the image hook makes it the animated avatar, or Sony's
+// when there is none), so it draws its mask again too - loading a picture into it underneath does not show.
+// A plain image box loads `uri` itself (Sony's own address when going back).
+bool refresh_view(Obj view, const char* uri, bool animated) {
+	Obj src_get = nullptr, src_set = nullptr;
+	for (Obj k = mono_object_get_class(view); k != nullptr && src_set == nullptr; k = mono_class_get_parent(k)) {
+		Obj prop = mono_class_get_property_from_name(k, "Source");
+		if (prop != nullptr) {
+			src_get = mono_property_get_get_method(prop);
+			src_set = mono_property_get_set_method(prop);
+		}
+	}
+	if (src_get != nullptr && src_set != nullptr) {
+		Obj exc = nullptr;
+		Obj src = mono_runtime_invoke(src_get, view, nullptr, &exc);
+		if (exc == nullptr && src != nullptr) {
+			Obj clone = nullptr;
+			for (Obj k = mono_object_get_class(src); k != nullptr && clone == nullptr; k = mono_class_get_parent(k)) {
+				clone = mono_class_get_method_from_name(k, "DeepClone", 0);
+			}
+			Obj copy = nullptr;
+			if (clone != nullptr && invoke(clone, src, nullptr, "JToken.DeepClone", &copy) && copy != nullptr) {
+				void*      args[1] = {copy};
+				const bool ok      = invoke(src_set, view, args, "ReactImageBox.Source");
+				static int logged  = 0;
+				if (logged++ < 8) {
+					wp_log("avatar: view %p set again through its Source (%s)", view, ok ? "ok" : "FAILED");
+				}
+				return ok;
+			}
+		}
+	}
+	return view_load(view, uri, animated ? anim_option(nullptr) : nullptr);
+}
+
+// ---- animated game tiles (v1.7.0) ----------------------------------------------------------
+// /data/LiveShell/video/.tiles/<TITLE ID>.png (an animated PNG the daemon made; ShellUI sees it as kTileDir)
+// replaces that tile's icon0.png. Sony loads tile icons through ImageAsset.LoadAsync like avatars
+// ("/user/app/<ID>/sce_sys/icon0.png?ts=..+336_336_KeepFitSize_Bc7U", the PS Store
+// "/system_ex/rnps/apps/NPXS40047/appdb/default/icon0.png?ts=.."): the address becomes ours, without Sony's
+// ending, with a NEW animated ImageOptions. Sony's tile options squash the picture into a BC7 texture: a copy
+// of them (as avatars use) froze the tile on its first picture after the Media tab. Stable address, like
+// avatars. Tiles already on screen are switched by the widget walk; a removed / changed file switches them back
+// / again (the folder's time is watched, so a pick shows within a moment).
+constexpr const char* kTileDir = "/system_ex/vsh_asset/wallpaper/.tiles";
+struct TileOrig {
+	char tid[10];
+	char uri[200]; // Sony's address for the tile, loaded again when ours goes
+};
+TileOrig g_tile_orig[1024]; // any number of games (user)
+int      g_ntile_orig = 0, g_tile_logs = 0;
+long     g_tiles_mtime = -2;
+
+// The title id in a tile icon address: ".../app/<ID>/..", ".../apps/<ID>/..", ".../appmeta/<ID>/..", ".tiles/<ID>.png"
+bool tile_id(const char* u, char* id) {
+	const char* keys[] = {"/app/", "/apps/", "/appmeta/", "/.tiles/"};
+	for (const char* k : keys) {
+		const char* a = strstr(u, k);
+		if (a == nullptr) {
+			continue;
+		}
+		a += strlen(k);
+		size_t n = 0;
+		while (n < 9 && isalnum(static_cast<unsigned char>(a[n]))) {
+			id[n] = a[n];
+			++n;
+		}
+		id[n] = 0;
+		if (n == 9 && !isalnum(static_cast<unsigned char>(a[9]))) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// Our animated tile for this title: its address (with the file time, as avatars), or false when there is none.
+bool tile_file(const char* id, char* out, size_t cap) {
+	char        path[96];
+	struct stat st {};
+	snprintf(path, sizeof(path), "%s/%s.png", kTileDir, id);
+	if (stat(path, &st) != 0 || st.st_size <= 64) {
+		return false;
+	}
+	snprintf(out, cap, "%s?ts=%ld", path, static_cast<long>(st.st_mtime));
+	return true;
+}
+
+void remember_tile(const char* id, const char* uri) {
+	for (int i = 0; i < g_ntile_orig; ++i) {
+		if (strcmp(g_tile_orig[i].tid, id) == 0) {
+			snprintf(g_tile_orig[i].uri, sizeof(g_tile_orig[i].uri), "%s", uri);
+			return;
+		}
+	}
+	TileOrig& o = g_tile_orig[g_ntile_orig < 1024 ? g_ntile_orig++ : (g_tick % 1024)];
+	snprintf(o.tid, sizeof(o.tid), "%s", id);
+	snprintf(o.uri, sizeof(o.uri), "%s", uri);
+}
+
+const char* tile_orig(const char* id) {
+	for (int i = 0; i < g_ntile_orig; ++i) {
+		if (strcmp(g_tile_orig[i].tid, id) == 0) {
+			return g_tile_orig[i].uri;
+		}
+	}
+	return nullptr;
+}
+
+bool tiles_exist() {
+	bool any = false;
+	if (DIR* d = opendir(kTileDir)) {
+		while (dirent* e = readdir(d)) {
+			any = any || strstr(e->d_name, ".png") != nullptr;
+		}
+		closedir(d);
+	}
+	return any;
+}
+
+
+Obj AssetLoad_Hook(Obj uri, Obj action, Obj option) {
+	char       u[200], ours[200];
+	const bool text = uri != nullptr && mono_ascii(uri, u, sizeof(u)) > 0;
+	if (text && strstr(u, kTileDir) != nullptr) { // our tile again (a box loading our address): animated
+		Obj opt = anim_option(nullptr);
+		return g_assetload_orig(uri, action, opt != nullptr ? opt : option);
+	}
+	if (text && strstr(u, "icon0.png") != nullptr) { // a tile icon: ours when there is one
+		char id[10];
+		if (tile_id(u, id) && tile_file(id, ours, sizeof(ours))) {
+			Obj opt = anim_option(nullptr); // new: not a copy of Sony's (BC7: a still picture)
+			if (opt != nullptr) {
+				remember_tile(id, u);
+				if (g_tile_logs++ < 20) {
+					wp_log("tile: %s -> %s", u, ours);
+				}
+				return g_assetload_orig(mono_string_new(g_domain, ours), action, opt);
+			}
+		}
+	}
+	if (text && strstr(u, kAvatarDir) != nullptr && strstr(u, "_still") == nullptr) { // ours (set in a Source): animated
+		Obj opt = anim_option(option);
+		return g_assetload_orig(uri, action, opt != nullptr ? opt : option);
+	}
+	const long user = text ? face_user(u) : 0;
+	Avatar*    a    = user > 0 ? avatar_of(user) : nullptr;
+	if (a == nullptr) {
+		return g_assetload_orig(uri, action, option);
+	}
+	if (g_loading_view != nullptr) {
+		remember_view(*a, g_loading_view, u);
+	}
+	const long t = avatar_uri(user, false, ours, sizeof(ours));
+	if (t != 0 && a->mtime == t) { // decoded: the animation
+		Obj opt = anim_option(option);
+		if (opt != nullptr) {
+			return g_assetload_orig(mono_string_new(g_domain, ours), action, opt);
+		}
+	} else if (t != 0) { // new, still decoding: its first picture
+		avatar_uri(user, true, ours, sizeof(ours));
+		return g_assetload_orig(mono_string_new(g_domain, ours), action, option);
+	}
+	return g_assetload_orig(uri, action, option);
+}
+
+void BoxLoad2_Hook(Obj self, Obj uri, Obj action, Obj option, bool set_image) {
+	Obj before     = g_loading_view;
+	g_loading_view = self;
+	g_boxload2_orig(self, uri, action, option, set_image);
+	g_loading_view = before;
+}
+
+void BoxLoad3_Hook(Obj self, Obj uri, Obj action, Obj option, bool set_image) {
+	Obj before     = g_loading_view;
+	g_loading_view = self;
+	g_boxload3_orig(self, uri, action, option, set_image);
+	g_loading_view = before;
+}
+
+// A Source (JObject) with its "uri" replaced: Newtonsoft's JObject.Parse of the changed text.
+Obj g_jparse = nullptr;
+
+Obj source_with_uri(Obj source, const char* uri) {
+	Obj  inner = nullptr;
+	Obj  str   = mono_object_to_string(source, &inner);
+	char text[1024];
+	if (str == nullptr || inner != nullptr || mono_ascii(str, text, sizeof(text)) >= sizeof(text) - 1) {
+		return nullptr;
+	}
+	char* key = strstr(text, "\"uri\"");
+	char* q1  = key != nullptr ? strchr(key + 5, '"') : nullptr;
+	char* q2  = q1 != nullptr ? strchr(q1 + 1, '"') : nullptr;
+	if (q2 == nullptr) {
+		return nullptr;
+	}
+	char out[1400];
+	snprintf(out, sizeof(out), "%.*s%s%s", static_cast<int>(q1 + 1 - text), text, uri, q2);
+	if (g_jparse == nullptr) {
+		Obj jo   = nullptr;
+		Obj nimg = open_image("/system_ex/common_ex/lib/Newtonsoft.Json.PlayStation.dll");
+		jo       = nimg != nullptr ? mono_class_from_name(nimg, "Newtonsoft.Json.Linq", "JObject") : nullptr;
+		g_jparse = jo != nullptr ? mono_class_get_method_from_name(jo, "Parse", 1) : nullptr;
+	}
+	Obj   parsed  = nullptr;
+	void* args[1] = {mono_string_new(g_domain, out)};
+	return g_jparse != nullptr && invoke(g_jparse, nullptr, args, "JObject.Parse", &parsed) ? parsed : nullptr;
+}
+
+// React Native's image view: Sony's avatar address -> ours once decoded, ours -> Sony's when it is gone. The
+// change is made in the Source itself: for Sony's address the image cache hands back Sony's picture without
+// loading anything (so the image hook alone never sees it for an avatar already shown).
+void SetSource_Hook(Obj self, Obj source) {
+	Obj before     = g_loading_view;
+	g_loading_view = self;
+	Obj use        = source;
+	Obj inner      = nullptr;
+	Obj str        = source != nullptr ? mono_object_to_string(source, &inner) : nullptr;
+	char text[400], uri[200];
+	if (str != nullptr && inner == nullptr && mono_ascii(str, text, sizeof(text)) > 0) {
+		const long face = face_user(text);
+		const char* mine = strstr(text, kAvatarDir);
+		const long  user = face > 0 ? face : mine != nullptr ? strtol(mine + strlen(kAvatarDir) + 1, nullptr, 10) : 0;
+		Avatar*     a    = user > 0 ? avatar_of(user) : nullptr;
+		const long  t    = a != nullptr ? avatar_uri(user, false, uri, sizeof(uri)) : 0;
+		if (a != nullptr && face > 0) {
+			const char* f = strstr(text, "profilecache:");
+			const char* e = f != nullptr ? strchr(f, '"') : nullptr;
+			char        fu[160];
+			snprintf(fu, sizeof(fu), "%.*s", e != nullptr ? static_cast<int>(e - f) : 0, f != nullptr ? f : "");
+			remember_view(*a, self, fu);
+			if (t != 0 && a->mtime == t) {
+				Obj changed = source_with_uri(source, uri);
+				use         = changed != nullptr ? changed : source;
+			}
+		} else if (a != nullptr && mine != nullptr && (t == 0 || a->mtime != t)) { // ours, but gone or changed
+			const char* back = nullptr;
+			for (int i = 0; i < a->nviews && back == nullptr; ++i) {
+				back = a->views[i].view == self && a->views[i].uri[0] != 0 ? a->views[i].uri : nullptr;
+			}
+			char dflt[120];
+			snprintf(dflt, sizeof(dflt), "profilecache:image/face/default?userid=%ld&size=m&salt=1", user);
+			Obj changed = source_with_uri(source, t != 0 && a->mtime == t ? uri : back != nullptr ? back : dflt);
+			use         = changed != nullptr ? changed : source;
+		}
+	}
+	g_setsrc_orig(self, use);
+	g_loading_view = before;
+}
+
+// ---- avatars already on screen: walk the widgets ----
+struct ClassGetters {
+	Obj klass = nullptr, first = nullptr, next = nullptr, image = nullptr;
+};
+ClassGetters g_cg[96];
+int          g_ncg = 0;
+Obj          g_asset_class = nullptr, g_asset_uri = nullptr;
+
+// A property's getter, looked up in the class and then its parents (the lookup itself stays in one class).
+Obj getter(Obj klass, const char* name) {
+	for (Obj k = klass; k != nullptr; k = mono_class_get_parent(k)) {
+		Obj prop = mono_class_get_property_from_name(k, name);
+		Obj get  = prop != nullptr ? mono_property_get_get_method(prop) : nullptr;
+		if (get != nullptr) {
+			return get;
+		}
+	}
+	return nullptr;
+}
+
+int  g_scan_logs = 0;               // the first walks log what they saw
+int  g_scan_widgets = 0, g_scan_boxes = 0;
+char g_scan_sample[600];
+
+const ClassGetters* getters_of(Obj klass) {
+	for (int i = 0; i < g_ncg; ++i) {
+		if (g_cg[i].klass == klass) {
+			return &g_cg[i];
+		}
+	}
+	if (g_ncg >= 96) {
+		return nullptr;
+	}
+	ClassGetters& c = g_cg[g_ncg++];
+	c.klass         = klass;
+	c.first         = getter(klass, "FirstChildBase");
+	c.next          = getter(klass, "NextSiblingBase");
+	c.image         = getter(klass, "Image");
+	return &c;
+}
+
+Obj call0(Obj method, Obj obj) {
+	Obj exc = nullptr;
+	Obj r   = method != nullptr && obj != nullptr ? mono_runtime_invoke(method, obj, nullptr, &exc) : nullptr;
+	return exc != nullptr ? nullptr : r;
+}
+
+void avatar_switch(Avatar& a, Obj view);
+
+// One widget: an image box showing Sony's avatar is remembered (and switched when the user has one ready).
+int scan_widget(Obj w, int depth, int& budget) {
+	int found = 0;
+	while (w != nullptr && budget-- > 0) {
+		const ClassGetters* c = getters_of(mono_object_get_class(w));
+		if (c == nullptr) {
+			return found;
+		}
+		++g_scan_widgets;
+		if (c->image != nullptr) {
+			Obj asset = call0(c->image, w);
+			if (asset != nullptr && mono_object_get_class(asset) == g_asset_class) {
+				Obj  uri = call0(g_asset_uri, asset);
+				char u[200];
+				u[0] = 0;
+				const long user = uri != nullptr && mono_ascii(uri, u, sizeof(u)) > 0 ? face_user(u) : 0;
+				++g_scan_boxes;
+				if (g_scan_logs < 3 && strlen(g_scan_sample) + strlen(u) + 4 < sizeof(g_scan_sample) &&
+				    (strstr(u, "profile") != nullptr || strstr(u, "face") != nullptr || g_scan_boxes <= 6)) {
+					strcat(g_scan_sample, u);
+					strcat(g_scan_sample, " | ");
+				}
+				Avatar*    a    = user > 0 ? avatar_of(user) : nullptr;
+				if (a != nullptr) {
+					remember_view(*a, w, u);
+					avatar_switch(*a, w);
+					++found;
+				}
+				if (strstr(u, kTileDir) != nullptr || strstr(u, "icon0.png") != nullptr) { // a game tile
+					char id[10], tu[200];
+					if (tile_id(u, id)) {
+						const bool  have = tile_file(id, tu, sizeof(tu));
+						const bool  ours = strstr(u, kTileDir) != nullptr;
+						const char* back = ours && !have ? tile_orig(id) : nullptr;
+						if (back != nullptr) { // removed: Sony's icon again
+							const bool ok = view_load(w, back, nullptr);
+							if (g_tile_logs++ < 40) {
+								wp_log("tile: %s back to %s: %s", id, back, ok ? "ok" : "FAILED");
+							}
+						} else if (have && strcmp(u, tu) != 0) { // new, or changed: ours (animated)
+							if (!ours) {
+								remember_tile(id, u);
+							}
+							const bool ok = view_load(w, tu, anim_option(nullptr));
+							if (g_tile_logs++ < 40) {
+								wp_log("tile: box %s -> %s: %s", id, tu, ok ? "ok" : "FAILED");
+							}
+						}
+					}
+				}
+			}
+		}
+		if (depth < 64 && c->first != nullptr) {
+			found += scan_widget(call0(c->first, w), depth + 1, budget);
+		}
+		w = c->next != nullptr ? call0(c->next, w) : nullptr;
+	}
+	return found;
+}
+
+int avatar_scan() {
+	if (g_asset_class == nullptr) {
+		g_asset_class = find_class("Sce.PlayStation.PUI", "ImageAsset");
+		g_asset_uri   = g_asset_class != nullptr ? getter(g_asset_class, "Uri") : nullptr;
+	}
+	Obj sm   = find_class("Sce.PlayStation.PUI", "SceneManager");
+	Obj ig   = sm != nullptr ? getter(sm, "Instance") : nullptr;
+	Obj exc0 = nullptr;
+	Obj inst = ig != nullptr ? mono_runtime_invoke(ig, nullptr, nullptr, &exc0) : nullptr; // static
+	if (exc0 != nullptr || inst == nullptr || g_asset_class == nullptr) {
+		return -1;
+	}
+	int  found = 0, budget = 30000, nscenes = 0;
+	Obj  seen[96];
+	char info[700];
+	info[0]          = 0;
+	g_scan_widgets   = g_scan_boxes = 0;
+	g_scan_sample[0] = 0;
+	const char* lists[3] = {"SceneLayers", "RenderList", "OverlayList"};
+	for (const char* ln : lists) {
+		Obj layers = call0(getter(sm, ln), inst);
+		if (layers == nullptr) {
+			continue;
+		}
+		Obj       lk    = mono_object_get_class(layers);
+		Obj       count = call0(getter(lk, "Count"), layers);
+		Obj       item  = mono_class_get_method_from_name(lk, "get_Item", 1);
+		const int n     = count != nullptr ? *reinterpret_cast<int*>(static_cast<char*>(count) + 16) : 0;
+		for (int i = 0; i < n && i < 64 && item != nullptr; ++i) {
+			void* args[1] = {&i};
+			Obj   exc     = nullptr;
+			Obj   scene   = mono_runtime_invoke(item, layers, args, &exc);
+			bool  dup     = exc != nullptr || scene == nullptr;
+			for (int k = 0; k < nscenes && !dup; ++k) {
+				dup = seen[k] == scene;
+			}
+			if (dup || nscenes >= 96) {
+				continue;
+			}
+			seen[nscenes++] = scene;
+			Obj         root = call0(getter(mono_object_get_class(scene), "RootWidget"), scene);
+			const int   w0   = g_scan_widgets;
+			found += scan_widget(root, 0, budget);
+			const char* sn   = mono_class_get_name(mono_object_get_class(scene));
+			const char* rn   = root != nullptr ? mono_class_get_name(mono_object_get_class(root)) : "-";
+			char        one[96];
+			snprintf(one, sizeof(one), "%s/%s:%s:%d ", ln[0] == 'S' ? "L" : ln[0] == 'R' ? "R" : "O", sn != nullptr ? sn : "?",
+			         rn != nullptr ? rn : "?", g_scan_widgets - w0);
+			if (strlen(info) + strlen(one) + 1 < sizeof(info)) {
+				strcat(info, one);
+			}
+		}
+	}
+	if (g_scan_logs++ < 3) {
+		wp_log("avatar scan: %d scenes, %d widgets, %d image boxes, %d avatars; scenes: %.500s", nscenes, g_scan_widgets, g_scan_boxes,
+		       found, info);
+		wp_log("avatar scan seen: %.560s", g_scan_sample);
+	}
+	return found;
+}
+
+void avatar_hooks() {
+	g_avatar_hooked = true;
+	detour_method("Sce.PlayStation.PUI", "ImageAsset", "LoadAsync", 3, reinterpret_cast<void*>(&AssetLoad_Hook),
+	              reinterpret_cast<void**>(&g_assetload_orig));
+	detour_method("ReactNative.PUI", "ReactImageBox", "set_Source", 1, reinterpret_cast<void*>(&SetSource_Hook),
+	              reinterpret_cast<void**>(&g_setsrc_orig));
+	// image boxes outside React Native (the top bar's avatar): UI2 and UI3 ImageBox.LoadAsync(uri, action, option, set)
+	Obj         pui   = open_image("/system_ex/common_ex/lib/Sce.PlayStation.PUI.dll");
+	const char* ns[2] = {"Sce.PlayStation.PUI.UI2", "Sce.PlayStation.PUI.UI3"};
+	void*       hk[2] = {reinterpret_cast<void*>(&BoxLoad2_Hook), reinterpret_cast<void*>(&BoxLoad3_Hook)};
+	void**      og[2] = {reinterpret_cast<void**>(&g_boxload2_orig), reinterpret_cast<void**>(&g_boxload3_orig)};
+	for (int i = 0; i < 2; ++i) {
+		Obj             k    = pui != nullptr ? mono_class_from_name(pui, ns[i], "ImageBox") : nullptr;
+		Obj             m    = k != nullptr ? mono_class_get_method_from_name(k, "LoadAsync", 4) : nullptr;
+		const uint64_t  addr = m != nullptr ? reinterpret_cast<uint64_t>(mono_compile_method(m)) : 0;
+		const uintptr_t old  = set_ucred_to_ptrace();
+		const bool      ok   = addr != 0 && InstallDetour(addr, hk[i], og[i]) && *og[i] != nullptr;
+		if (old != 0) {
+			set_proc_authid(getpid(), old);
+		}
+		wp_log("hook %s.ImageBox.LoadAsync(4): %s", ns[i], ok ? "installed" : "FAILED");
+	}
+	// avatar files already there: decoded from now on (users seen later start theirs when first shown)
+	if (DIR* d = opendir(kAvatarDir)) {
+		while (dirent* e = readdir(d)) {
+			const long u = strtol(e->d_name, nullptr, 10);
+			if (u > 0 && strstr(e->d_name, "_still") == nullptr) {
+				avatar_of(u);
+			}
+		}
+		closedir(d);
+	}
+}
+
+// Sony's own "this user's profile changed" signal (what follows a new PSN avatar): every avatar of that user
+// on screen is loaded again, with a new address (so not from the image cache), through the image hook - the
+// animated one, or Sony's when it is gone. At most every 4 s per user.
+void profile_changed(long user) {
+	static Obj    notify = nullptr, inst_get = nullptr;
+	static bool   looked = false;
+	static long   last_user[8] {};
+	static int    last_tick[8] {};
+	if (!looked) {
+		looked = true;
+		Obj k    = find_class("Sce.Vsh.ShellUI.ProfileCache", "ProfileCacheManager");
+		notify   = k != nullptr ? mono_class_get_method_from_name(k, "NotifyUpdateProfileCacheVersion", 1) : nullptr;
+		inst_get = k != nullptr ? getter(k, "Instance") : nullptr;
+	}
+	int slot = 0;
+	while (slot < 7 && last_user[slot] != 0 && last_user[slot] != user) {
+		++slot;
+	}
+	if (last_user[slot] == user && g_tick - last_tick[slot] < 240) {
+		return;
+	}
+	last_user[slot] = user;
+	last_tick[slot] = g_tick;
+	Obj        exc  = nullptr;
+	Obj        inst = inst_get != nullptr ? mono_runtime_invoke(inst_get, nullptr, nullptr, &exc) : nullptr; // static
+	int        uid  = static_cast<int>(user);
+	void*      args[1] = {&uid};
+	const bool ok   = inst != nullptr && exc == nullptr && notify != nullptr && invoke(notify, inst, args, "NotifyUpdateProfileCacheVersion");
+	wp_log("avatar: user %ld - the profile-changed signal %s", user, ok ? "sent" : "FAILED");
+}
+
+// A view showing Sony's avatar for a user whose animated one is decoded: switch it now.
+void avatar_switch(Avatar& a, Obj view) {
+	char       uri[200];
+	const long t = avatar_uri(a.user, false, uri, sizeof(uri));
+	if (t != 0 && a.mtime == t) {
+		refresh_view(view, uri, true);
+		profile_changed(a.user);
+	}
+}
+
+int g_scan_next = 0; // tick of the next walk over the widgets
+
+// Every ~0.25 s: a new, changed or removed avatar file -> decode it, then switch every avatar of that user.
+void avatar_tick() {
+	if (!g_avatar_hooked) {
+		if (g_tick >= 120) { // ~2 s after the module's start: from then on every avatar shown is remembered
+			avatar_hooks();
+			g_scan_next = g_tick + 60;
+		}
+		return;
+	}
+	if (g_tick % 15 == 0) { // the tiles folder changed (a pick, a removal): walk the screen now
+		struct stat st {};
+		const long  m = stat(kTileDir, &st) == 0 ? static_cast<long>(st.st_mtime) : -1;
+		if (m != g_tiles_mtime) {
+			if (g_tiles_mtime != -2) {
+				g_scan_next = g_tick + 1;
+			}
+			g_tiles_mtime = m;
+		}
+	}
+	if (g_scan_next != 0 && g_tick >= g_scan_next) {
+		DIR* d   = opendir(kAvatarDir);
+		bool any = false;
+		if (d != nullptr) {
+			while (dirent* e = readdir(d)) {
+				any = any || strtol(e->d_name, nullptr, 10) > 0;
+			}
+			closedir(d);
+		}
+		g_scan_next = g_tick + 1200; // ~20 s (only walks while someone has an animated avatar)
+		any = any || g_ntile_orig > 0 || tiles_exist(); // animated tiles: walked too
+		if (any) {
+			const int n = avatar_scan();
+			static int logged = 0;
+			if (logged++ < 5) {
+				wp_log("avatar: %d avatars on screen", n);
+			}
+		}
+	}
+	if (g_tick % 15 != 0) {
+		return;
+	}
+	for (Avatar& a : g_avatars) {
+		if (a.user <= 0) {
+			continue;
+		}
+		char       uri[200];
+		const long t = avatar_uri(a.user, false, uri, sizeof(uri));
+		if (t == 0 && a.mtime != 0) { // removed: Sony's avatar everywhere again
+			a.mtime = a.want = 0;
+			int n = 0;
+			for (int i = 0; i < a.nviews; ++i) {
+				n += refresh_view(a.views[i].view, a.views[i].uri, false) ? 1 : 0;
+			}
+			wp_log("avatar: user %ld back to the PSN avatar (%d views)", a.user, n);
+			profile_changed(a.user);
+			continue;
+		}
+		if (t == 0 || t == a.mtime) {
+			continue;
+		}
+		if (a.want != t) { // new or changed: decode it in a hidden image box (and find the avatars shown now)
+			avatar_scan();
+			Obj k = find_class("Sce.PlayStation.PUI", "ImageBox");
+			Obj c = k != nullptr ? mono_class_get_method_from_name(k, ".ctor", 0) : nullptr;
+			Obj b = k != nullptr ? mono_object_new(g_domain, k) : nullptr;
+			if (b == nullptr || c == nullptr || !invoke(c, b, nullptr, "ImageBox()")) {
+				continue;
+			}
+			mono_gchandle_new(b, 1);
+			a.box   = b;
+			a.want  = t;
+			a.since = g_tick;
+			view_load(b, uri, anim_option(nullptr));
+			continue;
+		}
+		Obj       frames = property_get(mono_object_get_class(a.box), a.box, "FrameCount");
+		const int fc     = frames != nullptr ? *reinterpret_cast<int*>(static_cast<char*>(frames) + 16) : 0;
+		if (fc > 1 || g_tick - a.since > 300) { // decoded (or 5 s: switch anyway, the views decode it themselves)
+			a.mtime = t;
+			int n   = 0;
+			for (int i = 0; i < a.nviews; ++i) {
+				n += refresh_view(a.views[i].view, uri, true) ? 1 : 0;
+			}
+			wp_log("avatar: user %ld animated, %d views switched (%d frames, %d ticks)", a.user, n, fc, g_tick - a.since);
+			profile_changed(a.user);
+		}
+	}
+}
+
 void* wallpaper_thread(void*) {
 	sleep(3); // was 5: a quicker first picture
 	char seen[512];
@@ -3323,14 +5701,14 @@ void* wallpaper_thread(void*) {
 	// PS Store only, read BEFORE the first clip starts: the loop below only reads it every 0.3 s, so
 	// the video showed on the highlighted tile for a moment after loading the ELF (user, v1.2).
 	// Start hidden then; the Store tile fades it in as usual.
-	if (FILE* f = fopen(kStoreOnlyFile, "r")) {
+	if (OptFile* f = opt_open(kStoreOnlyFile)) {
 		int on = 0;
-		if (fscanf(f, "%d", &on) == 1 && on == 1) {
+		if (opt_scanf(f, "%d", &on) == 1 && on == 1) {
 			g_store_only.store(true);
 			g_fade = 1.0f;
 			wp_log("PS Store only: on from the start (video starts hidden)");
 		}
-		fclose(f);
+		opt_close(f);
 	}
 	if (guard_exists()) {
 		wp_log("video: last attempt did not survive (%s still there)", kGuardFile);
@@ -3350,13 +5728,13 @@ void* wallpaper_thread(void*) {
 	char now[512];
 	for (;;) {
 		usleep(300 * 1000);
-		if (FILE* f = fopen(kDimFile, "r")) {
+		if (OptFile* f = opt_open(kDimFile)) {
 			int dim = -1;
-			if (fscanf(f, "%d", &dim) == 1 && dim >= 0 && dim <= 90 && dim != g_dim_req.load()) {
+			if (opt_scanf(f, "%d", &dim) == 1 && dim >= 0 && dim <= 90 && dim != g_dim_req.load()) {
 				g_dim_req.store(dim);
 				wp_log("dim request: %d%%", dim);
 			}
-			fclose(f);
+			opt_close(f);
 		}
 		// Repeat the status every ~2 s: a payload started while we already play learns it at once
 		// (it waited 40 s for a change before, test v11-24).
@@ -3365,57 +5743,57 @@ void* wallpaper_thread(void*) {
 			status_beat = 0;
 			to_payload('S', g_last_status, strlen(g_last_status));
 		}
-		if (FILE* f = fopen(kVolumeFile, "r")) {
+		if (OptFile* f = opt_open(kVolumeFile)) {
 			int vol = -1;
-			if (fscanf(f, "%d", &vol) == 1 && vol >= 0 && vol <= 100 && vol != g_vol_req.load()) {
+			if (opt_scanf(f, "%d", &vol) == 1 && vol >= 0 && vol <= 100 && vol != g_vol_req.load()) {
 				g_vol_req.store(vol);
 			}
-			fclose(f);
+			opt_close(f);
 		}
-		if (FILE* f = fopen(kStoreOnlyFile, "r")) {
+		if (OptFile* f = opt_open(kStoreOnlyFile)) {
 			int on = 0;
-			if (fscanf(f, "%d", &on) == 1 && (on == 0 || on == 1) && (on == 1) != g_store_only.load()) {
+			if (opt_scanf(f, "%d", &on) == 1 && (on == 0 || on == 1) && (on == 1) != g_store_only.load()) {
 				g_store_only.store(on == 1);
 				wp_log("PS Store only: %s", on ? "on" : "off");
 			}
-			fclose(f);
+			opt_close(f);
 		}
-		if (FILE* f = fopen(kMenusFile, "r")) {
+		if (OptFile* f = opt_open(kMenusFile)) {
 			int menus = 0;
-			if (fscanf(f, "%d", &menus) == 1 && (menus == 0 || menus == 1) && menus != g_menus_req.load()) {
+			if (opt_scanf(f, "%d", &menus) == 1 && (menus == 0 || menus == 1) && menus != g_menus_req.load()) {
 				g_menus_req.store(menus);
 				wp_log("menus request: %s", menus ? "hide" : "show");
 			}
-			fclose(f);
+			opt_close(f);
 		}
-		if (FILE* f = fopen("/system_tmp/liveshell/tint.txt", "r")) {
+		if (OptFile* f = opt_open("/system_tmp/liveshell/tint.txt")) {
 			int tn = 0;
-			if (fscanf(f, "%d", &tn) == 1 && tn >= 0 && tn <= 5 && tn != g_tint_req.load()) {
+			if (opt_scanf(f, "%d", &tn) == 1 && tn >= 0 && tn <= 5 && tn != g_tint_req.load()) {
 				g_tint_req.store(tn);
 				g_dim_shown = -1; // refresh_dim paints the new colour
 				wp_log("colour: %d", tn);
 			}
-			fclose(f);
+			opt_close(f);
 		}
-		if (FILE* f = fopen("/system_tmp/liveshell/launchfx.txt", "r")) {
+		if (OptFile* f = opt_open("/system_tmp/liveshell/launchfx.txt")) {
 			int lf = 0;
-			if (fscanf(f, "%d", &lf) == 1 && lf >= 0 && lf <= 2 && lf != g_lfx_req.load()) {
+			if (opt_scanf(f, "%d", &lf) == 1 && lf >= 0 && lf <= 2 && lf != g_lfx_req.load()) {
 				g_lfx_req.store(lf);
 				wp_log("launch effect: %d", lf);
 			}
-			fclose(f);
+			opt_close(f);
 		}
-		if (FILE* f = fopen(kParallaxFile, "r")) {
+		if (OptFile* f = opt_open(kParallaxFile)) {
 			int px = 0;
-			if (fscanf(f, "%d", &px) == 1 && (px == 0 || px == 1) && px != g_parallax_req.load()) {
+			if (opt_scanf(f, "%d", &px) == 1 && (px == 0 || px == 1) && px != g_parallax_req.load()) {
 				g_parallax_req.store(px);
 				wp_log("parallax request: %d", px);
 			}
-			fclose(f);
+			opt_close(f);
 		}
-		if (FILE* f = fopen(kLooksFile, "r")) {
+		if (OptFile* f = opt_open(kLooksFile)) {
 			int v[kLooks] = {-1, -1, -1, -1};
-			if (fscanf(f, "%d %d %d %d", &v[0], &v[1], &v[2], &v[3]) == 4) {
+			if (opt_scanf(f, "%d %d %d %d", &v[0], &v[1], &v[2], &v[3]) == 4) {
 				for (int l = 0; l < kLooks; ++l) {
 					if (v[l] >= 0 && v[l] <= 2 && v[l] != g_look_req[l].load()) {
 						g_look_req[l].store(v[l]);
@@ -3423,7 +5801,7 @@ void* wallpaper_thread(void*) {
 					}
 				}
 			}
-			fclose(f);
+			opt_close(f);
 		}
 		read_request_line(now, sizeof(now));
 		if (now[0] == 0 || strcmp(now, seen) == 0) {
@@ -3522,24 +5900,65 @@ extern "C" int main(int argc, char const* argv[]) {
 		const uint8_t* b = reinterpret_cast<const uint8_t*>(update_addr);
 		wp_log("Application.Update starts with %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
 		       b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13]);
-		uint64_t next = 0;
-		if (b[0] == 0xe9) { // jmp rel32
-			int32_t rel = 0;
-			memcpy(&rel, b + 1, 4);
-			next = update_addr + 5 + static_cast<int64_t>(rel);
-		} else if (b[0] == 0xff && b[1] == 0x25 && b[2] == 0 && b[3] == 0 && b[4] == 0 && b[5] == 0) { // jmp [rip]
-			memcpy(&next, b + 6, 8);
-		} else if (b[0] == 0x48 && b[1] == 0xb8 && b[10] == 0xff && b[11] == 0xe0) { // mov rax, imm64; jmp rax
-			memcpy(&next, b + 2, 8);
+		// The jump's target lives in that tool's own memory (another ELF), execute-only too: it must be made
+		// readable before the detour can copy its first bytes (after rest mode OnionHEN is back first and the
+		// chain failed: "no other hook to chain after"). Up to 3 jumps in a row (two tools chained).
+		auto jump_target = [](uint64_t at) -> uint64_t {
+			const uint8_t* c = reinterpret_cast<const uint8_t*>(at);
+			uint64_t       t = 0;
+			if (c[0] == 0xe9) { // jmp rel32
+				int32_t rel = 0;
+				memcpy(&rel, c + 1, 4);
+				t = at + 5 + static_cast<int64_t>(rel);
+			} else if (c[0] == 0xff && c[1] == 0x25 && c[2] == 0 && c[3] == 0 && c[4] == 0 && c[5] == 0) { // jmp [rip]
+				memcpy(&t, c + 6, 8);
+			} else if (c[0] == 0x48 && c[1] == 0xb8 && c[10] == 0xff && c[11] == 0xe0) { // mov rax, imm64; jmp rax
+				memcpy(&t, c + 2, 8);
+			}
+			return t;
+		};
+		uint64_t next = jump_target(update_addr);
+		// Best: the other tool's hook is "jmp [rip+0] <address>" at the start of Update. Point that address at
+		// us and call the old one when we are done: Sony -> LiveShell -> that tool -> Sony. Only these 8 bytes
+		// in Sony's page change (writable: we hook there anyway); the other tool's code is never touched (after
+		// rest mode OnionHEN's toolbox is back first, and patching its code failed: "chaining ... failed").
+		if (next != 0 && b[0] == 0xff && b[1] == 0x25 && b[2] == 0 && b[3] == 0 && b[4] == 0 && b[5] == 0) {
+			g_update_orig       = reinterpret_cast<UpdateFn>(next);
+			const uint64_t mine = reinterpret_cast<uint64_t>(&Update_Hook);
+			memcpy(reinterpret_cast<void*>(update_addr + 6), &mine, sizeof(mine));
+			uint64_t now = 0;
+			memcpy(&now, reinterpret_cast<const void*>(update_addr + 6), sizeof(now));
+			if (now == mine) {
+				wp_log("Application.Update already hooked by another tool: its jump now leads to us first, then to it (%#lx)",
+				       static_cast<unsigned long>(next));
+				next = 0; // done
+			} else {
+				g_update_orig = nullptr;
+			}
 		}
-		if (next == 0 || !InstallDetour(next, reinterpret_cast<void*>(&Update_Hook),
-		                                reinterpret_cast<void**>(&g_update_orig)) ||
-		    g_update_orig == nullptr) {
+		for (int depth = 0; next != 0 && g_update_orig == nullptr && depth < 3; ++depth) {
+			if (sceKernelMprotect != nullptr) {
+				(void)sceKernelMprotect(reinterpret_cast<void*>(next & ~static_cast<uint64_t>(0x3fff)), 0x8000, 0x7);
+			}
+			if (InstallDetour(next, reinterpret_cast<void*>(&Update_Hook), reinterpret_cast<void**>(&g_update_orig)) &&
+			    g_update_orig != nullptr) {
+				break;
+			}
+			g_update_orig = nullptr;
+			const uint64_t further = jump_target(next);
+			wp_log("Application.Update: chaining at %#lx failed, next jump %#lx", static_cast<unsigned long>(next),
+			       static_cast<unsigned long>(further));
+			next = further;
+		}
+		if (g_update_orig == nullptr) {
 			wp_log("Application.Update: no other hook to chain after (next %#lx)", static_cast<unsigned long>(next));
+			write_status("failed hook"); // the payload restarts the home screen once (an old module holds the hook)
 			return fail("LiveShell Engine could not start (hook failed)", 4);
 		}
-		wp_log("Application.Update already hooked by another tool: chained after it at %#lx",
-		       static_cast<unsigned long>(next));
+		if (next != 0) {
+			wp_log("Application.Update already hooked by another tool: chained after it at %#lx",
+			       static_cast<unsigned long>(next));
+		}
 	}
 	wp_log("PUI.Application.Update hooked");
 	g_step.store("hooked, waiting for UI ticks");
@@ -3554,6 +5973,12 @@ extern "C" int main(int argc, char const* argv[]) {
 	} else {
 		wp_log("wallpaper_thread start failed");
 	}
+#ifdef LIVESHELL_RESEARCH_DUMP
+	pthread_t dt;
+	if (pthread_create(&dt, nullptr, dump_thread, nullptr) == 0) {
+		pthread_detach(dt);
+	}
+#endif
 	wp_log("init done");
 
 	// Never return: the injected ELF (and the detour hook code in it) must stay alive, the same

@@ -27,7 +27,7 @@ target_link_directories(liveshell_shellui PUBLIC "${ONIONHEN_PS5_STUB_DIR}")
 target_link_libraries(liveshell_shellui PUBLIC onion_payload onion_proc onion_platform onion_detour SceNotification kernel_sys)
 onion_strip_debug(liveshell_shellui)
 
-add_executable(liveshell ${D_CWD}/liveshell_daemon.cpp ${D_CWD}/liveshell_web.cpp ${D_CWD}/liveshell_tile.cpp ${D_CWD}/zstd_decompress.c)
+add_executable(liveshell ${D_CWD}/liveshell_daemon.cpp ${D_CWD}/liveshell_web.cpp ${D_CWD}/liveshell_tile.cpp ${D_CWD}/zstd_decompress.c ${D_CWD}/liveshell_apng.cpp ${D_CWD}/miniz.c)
 set_target_properties(liveshell PROPERTIES OUTPUT_NAME "liveshell.elf")
 target_link_options(liveshell PRIVATE "-Wl,--gc-sections")
 add_dependencies(liveshell liveshell_shellui NineS onion_proc onion_platform onion_elfldr)
@@ -35,6 +35,7 @@ set_source_files_properties(${D_CWD}/liveshell_daemon.cpp PROPERTIES OBJECT_DEPE
 set_source_files_properties(${D_CWD}/liveshell_web.cpp PROPERTIES OBJECT_DEPENDS "${D_CWD}/liveshell_page.html;${D_CWD}/liveshell_remote.html")
 set_source_files_properties(${D_CWD}/liveshell_tile.cpp PROPERTIES OBJECT_DEPENDS "${D_CWD}/icon0.png")
 target_compile_definitions(liveshell PRIVATE
+	AUDIO_SAMPLE_RATE=48000 MINIGB_APU_AUDIO_FORMAT_S16SYS
 	LIVESHELL_SHELLUI_ELF="${ONIONHEN_OUT_BIN}/liveshell_shellui.elf"
 	LIVESHELL_PAGE_HTML="${D_CWD}/liveshell_page.html"
 	LIVESHELL_REMOTE_HTML="${D_CWD}/liveshell_remote.html"

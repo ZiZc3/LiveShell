@@ -87,8 +87,8 @@ std::string json_str(const std::string& s) {
 std::string state_json() {
 	const State st = get_state();
 	std::string j  = std::string("{\"enabled\":") + (st.enabled ? "true" : "false") + ",\"dim\":" + std::to_string(st.dim) + ",\"volume\":" + std::to_string(st.volume) +
-	                ",\"looks\":[" + std::to_string(st.looks[0]) + "," + std::to_string(st.looks[1]) + "," + std::to_string(st.looks[2]) + "," + std::to_string(st.looks[3]) + "]" + ",\"shuffle\":" + (st.shuffle ? "true" : "false") + ",\"mainvideo\":" + (st.main_video ? "true" : "false") + ",\"gamevideos\":" + (st.game_videos ? "true" : "false") + ",\"gamepause\":" + (st.game_pause ? "true" : "false") + ",\"menuhide\":" + (st.menu_hide ? "true" : "false") + ",\"storeonly\":" + (st.store_only ? "true" : "false") + ",\"parallax\":" + (st.parallax ? "true" : "false") + ",\"automatch\":" + (st.auto_match ? "true" : "false") + ",\"resume\":" + (st.resume ? "true" : "false") + ",\"launchfx\":" + std::to_string(st.launchfx) + ",\"plbak\":" + (st.pl_bak ? "true" : "false") + ",\"tint\":" + std::to_string(st.tint) + ",\"playlist\":" + json_str(st.playlist) + ",\"users\":" + users_json() + ",\"gamehide\":" + (st.game_hide ? "true" : "false") +
-	                ",\"ip\":" + json_str(st.ip) + ",\"port\":" + std::to_string(kWebPort) + ",\"games\":" + json_str(games_text()) + ",\"game\":" + json_str(st.game) + ",\"status\":" + json_str(st.status) + ",\"current\":" + json_str(st.current) + ",\"main4k\":" + (st.main_video && clip_is_big(st.current) ? "true" : "false") + ",\"videos\":[";
+	                ",\"looks\":[" + std::to_string(st.looks[0]) + "," + std::to_string(st.looks[1]) + "," + std::to_string(st.looks[2]) + "," + std::to_string(st.looks[3]) + "]" + ",\"shuffle\":" + (st.shuffle ? "true" : "false") + ",\"mainvideo\":" + (st.main_video ? "true" : "false") + ",\"gamevideos\":" + (st.game_videos ? "true" : "false") + ",\"gamepause\":" + (st.game_pause ? "true" : "false") + ",\"menuhide\":" + (st.menu_hide ? "true" : "false") + ",\"storeonly\":" + (st.store_only ? "true" : "false") + ",\"parallax\":" + (st.parallax ? "true" : "false") + ",\"automatch\":" + (st.auto_match ? "true" : "false") + ",\"resume\":" + (st.resume ? "true" : "false") + ",\"launchfx\":" + std::to_string(st.launchfx) + ",\"autonext\":" + std::to_string(st.autonext) + ",\"plbak\":" + (st.pl_bak ? "true" : "false") + ",\"tint\":" + std::to_string(st.tint) + ",\"playlist\":" + json_str(st.playlist) + ",\"users\":" + users_json() + ",\"gamehide\":" + (st.game_hide ? "true" : "false") +
+	                ",\"ip\":" + json_str(st.ip) + ",\"port\":" + std::to_string(kWebPort) + ",\"games\":" + json_str(games_text()) + ",\"game\":" + json_str(st.game) + ",\"status\":" + json_str(st.status) + ",\"current\":" + json_str(st.current) + ",\"main4k\":false,\"videos\":[";
 	const std::vector<std::string> fav = favorites();
 	for (size_t i = 0; i < st.videos.size(); ++i) {
 		const Video& v = st.videos[i];
@@ -579,6 +579,62 @@ void handle(int fd) {
 	if (post) {
 		if (path == "/api/upload") {
 			save_upload(fd, query, headers, body, have);
+		} else if (path == "/api/avatar") { // ?id=<user id>, raw body: an (animated) PNG, at most 16 MB
+			const char* cl   = strcasestr(headers, "\nContent-Length:");
+			const long  size = cl != nullptr ? strtol(cl + 16, nullptr, 10) : 0;
+			const size_t id  = query.find("id=");
+			if (size <= 0 || size > 16 * 1024 * 1024 || id == std::string::npos) {
+				reply_json(fd, result_json(false, size > 16 * 1024 * 1024 ? "The picture is too big (16 MB at most)" : "No picture"));
+			} else {
+				std::string data(body, have < static_cast<size_t>(size) ? have : static_cast<size_t>(size));
+				static thread_local char chunk[64 * 1024];
+				while (data.size() < static_cast<size_t>(size)) {
+					const size_t  want = std::min(sizeof(chunk), static_cast<size_t>(size) - data.size());
+					const ssize_t got  = recv(fd, chunk, want, 0);
+					if (got <= 0) {
+						break;
+					}
+					data.append(chunk, static_cast<size_t>(got));
+				}
+				std::string err = data.size() == static_cast<size_t>(size) ? "" : "Upload stopped before the end";
+				const bool  ok  = err.empty() && save_avatar(atoi(query.c_str() + id + 3), data, err);
+				const size_t nm = query.find("name=");
+				if (ok) {
+					const std::string kept = keep_apng(nm == std::string::npos ? "" : url_decode(query.substr(nm + 5, query.find('&', nm) - (nm + 5))), data);
+					note_avatar_src(atoi(query.c_str() + id + 3), kept);
+				}
+				reply_json(fd, result_json(ok, err));
+			}
+		} else if (path == "/api/icon") { // ?name=<name>[&tid=<TITLE ID>], raw body: an APNG / GIF -> the icons library (+ that game's tile)
+			const char* cl   = strcasestr(headers, "\nContent-Length:");
+			const long  size = cl != nullptr ? strtol(cl + 16, nullptr, 10) : 0;
+			if (size <= 0 || size > 16 * 1024 * 1024) {
+				reply_json(fd, result_json(false, size > 16 * 1024 * 1024 ? "The picture is too big (16 MB at most)" : "No picture"));
+			} else {
+				std::string data(body, have < static_cast<size_t>(size) ? have : static_cast<size_t>(size));
+				static thread_local char chunk[64 * 1024];
+				while (data.size() < static_cast<size_t>(size)) {
+					const size_t  want = std::min(sizeof(chunk), static_cast<size_t>(size) - data.size());
+					const ssize_t got  = recv(fd, chunk, want, 0);
+					if (got <= 0) {
+						break;
+					}
+					data.append(chunk, static_cast<size_t>(got));
+				}
+				std::string err = data.size() == static_cast<size_t>(size) ? "" : "Upload stopped before the end";
+				const bool  gif = data.compare(0, 4, "GIF8") == 0;
+				const bool  png = data.size() > 40 && data.compare(1, 3, "PNG") == 0 && data.find("acTL") < 4096;
+				if (err.empty() && !gif && !png) {
+					err = "That is not an animated PNG or GIF";
+				}
+				const size_t      nm   = query.find("name="), id = query.find("tid=");
+				const std::string kept = err.empty() ? keep_apng(nm == std::string::npos ? "" : url_decode(query.substr(nm + 5, query.find('&', nm) - (nm + 5))), data, true) : "";
+				if (err.empty() && kept.empty()) {
+					err = "Cannot write to the icons folder";
+				}
+				const bool ok = err.empty() && (id == std::string::npos || set_tile_from(query.substr(id + 4, 9), kept, err));
+				reply_json(fd, result_json(ok, err));
+			}
 		} else if (path == "/thumb") {
 			save_thumb(fd, index_arg(query), headers, body, have);
 		} else if (path == "/api/playlists") { // the page's whole set of playlists (P/V lines)
@@ -679,6 +735,50 @@ void handle(int fd) {
 		} else {
 			reply(fd, "200 OK", "image/png", png.data(), png.size(), true);
 		}
+	} else if (path == "/avatar_anim") { // ?id=<user id>: the user's animated avatar (the page shows it)
+		const size_t      id  = query.find("id=");
+		const std::string png = id == std::string::npos ? std::string() : anim_avatar(atoi(query.c_str() + id + 3));
+		if (png.empty()) {
+			reply_404(fd);
+		} else {
+			reply(fd, "200 OK", "image/png", png.data(), png.size(), false);
+		}
+	} else if (path == "/api/apngs") { // the APNG library for "Choose Avatar"
+		reply_json(fd, apngs_json(query.find("k=icons") != std::string::npos)); // ?k=icons: the animated tiles' library
+	} else if (path == "/apng") { // ?p=<path>: one of them (the picker shows it)
+		const size_t      at  = query.find("p=");
+		const std::string png = at == std::string::npos ? std::string() : read_apng(url_decode(query.substr(at + 2, query.find('&', at) - (at + 2))));
+		if (png.empty()) {
+			reply_404(fd);
+		} else {
+			reply(fd, "200 OK", "image/png", png.data(), png.size(), true);
+		}
+	} else if (path == "/api/avatar_set") { // ?id=<user id>&p=<path>: that APNG as the user's avatar
+		const size_t id = query.find("id="), at = query.find("p=");
+		const bool   ok = id != std::string::npos && at != std::string::npos &&
+		                set_avatar_from(atoi(query.c_str() + id + 3), url_decode(query.substr(at + 2, query.find('&', at) - (at + 2))), error);
+		reply_json(fd, result_json(ok, error));
+	} else if (path == "/apngthumb") { // ?p=<library file>: its small moving preview (the pickers)
+		const size_t      at  = query.find("p=");
+		const std::string png = at == std::string::npos ? std::string() : apng_thumb(url_decode(query.substr(at + 2, query.find('&', at) - (at + 2))));
+		if (png.empty()) {
+			reply_404(fd);
+		} else {
+			reply(fd, "200 OK", "image/png", png.data(), png.size(), true);
+		}
+	} else if (path == "/api/tile_set") { // ?tid=<TITLE ID>&p=<library file>: that animation on the game's tile
+		const size_t id = query.find("tid="), at = query.find("p=");
+		const bool   ok = id != std::string::npos && at != std::string::npos &&
+		                set_tile_from(query.substr(id + 4, 9), url_decode(query.substr(at + 2, query.find('&', at) - (at + 2))), error);
+		reply_json(fd, result_json(ok, error));
+	} else if (path == "/api/tile_del") { // ?tid=<TITLE ID>: the tile's own icon again
+		const size_t id = query.find("tid=");
+		reply_json(fd, result_json(id != std::string::npos && delete_tile(query.substr(id + 4, 9)), "No animated tile"));
+	} else if (path == "/api/tiles") { // {"<TITLE ID>":"<library file>",..}
+		reply_json(fd, tiles_json());
+	} else if (path == "/api/avatar_del") { // ?id=<user id>: back to the PSN avatar
+		const size_t id = query.find("id=");
+		reply_json(fd, result_json(id != std::string::npos && delete_avatar(atoi(query.c_str() + id + 3)), "No animated avatar"));
 	} else if (path == "/api/user") { // ?id=<user id>&on=0|1
 		const size_t id = query.find("id="), on = query.find("on=");
 		const bool   ok = id != std::string::npos && set_user_on(atoi(query.c_str() + id + 3), on != std::string::npos && query[on + 3] == '1');
@@ -686,6 +786,10 @@ void handle(int fd) {
 	} else if (path == "/api/tint") { // ?v=0..5
 		const size_t v = query.find("v=");
 		set_tint(v == std::string::npos ? 0 : atoi(query.c_str() + v + 2));
+		reply_json(fd, result_json(true, error));
+	} else if (path == "/api/autonext") { // ?m=0|1|2
+		const size_t m = query.find("m=");
+		set_autonext(m == std::string::npos ? 0 : atoi(query.c_str() + m + 2));
 		reply_json(fd, result_json(true, error));
 	} else if (path == "/api/launchfx") { // ?m=0|1|2
 		const size_t m = query.find("m=");
@@ -702,8 +806,12 @@ void handle(int fd) {
 		set_look(key, v == std::string::npos ? 0 : atoi(query.c_str() + v + 2));
 		reply_json(fd, result_json(true, error));
 	} else if (path == "/api/games") {
-		std::string j = "[";
+		// The PS Store tile first: it can have its own video and animated tile like any game (v1.7.0)
+		std::string j = "[{\"tid\":\"NPXS40047\",\"name\":\"PlayStation Store\",\"clip\":" + json_str(saved_game_clip("NPXS40047")) + "}";
 		for (const Game& g : list_games()) {
+			if (g.tid == "NPXS40047") {
+				continue;
+			}
 			j += (j.size() > 1 ? "," : "");
 			j += "{\"tid\":" + json_str(g.tid) + ",\"name\":" + json_str(g.name) + ",\"clip\":" + json_str(saved_game_clip(g.tid)) + "}";
 		}
@@ -711,7 +819,7 @@ void handle(int fd) {
 	} else if (path == "/gameicon") {
 		const size_t      t   = query.find("tid=");
 		const std::string tid = t == std::string::npos ? "" : query.substr(t + 4, 9);
-		std::string       png = "/user/appmeta/" + tid + "/icon0.png";
+		std::string       png = tid == "NPXS40047" ? "/system_ex/rnps/apps/NPXS40047/appdb/default/icon0.png" : "/user/appmeta/" + tid + "/icon0.png";
 		struct stat       ps {};
 		if (stat(png.c_str(), &ps) != 0) {
 			png = "/user/appmeta/external/" + tid + "/icon0.png"; // a game on extended storage
@@ -724,11 +832,27 @@ void handle(int fd) {
 		if (is_title_id(tid.c_str()) && stat(png.c_str(), &st) == 0 && st.st_size > 0 && st.st_size < 4 * 1024 * 1024) {
 			data.resize(static_cast<size_t>(st.st_size));
 			const int f = open(png.c_str(), O_RDONLY);
-			if (f >= 0) {
-				if (read(f, &data[0], data.size()) != static_cast<ssize_t>(data.size())) {
-					data.clear();
+			size_t    got = 0;
+			if (f >= 0) { // in pieces: the PS Store's icon (a system folder) never came back in one read
+				while (got < data.size()) {
+					const ssize_t n = read(f, &data[got], data.size() - got);
+					if (n <= 0) {
+						break;
+					}
+					got += static_cast<size_t>(n);
 				}
 				close(f);
+			}
+			if (got != data.size()) {
+				data.clear();
+			}
+		}
+		if (data.empty() && tid == "NPXS40047") { // once: why the PS Store icon could not be read
+			static bool told = false;
+			if (!told) {
+				told        = true;
+				const int e = stat(png.c_str(), &st) == 0 ? 0 : errno;
+				log("library: PS Store icon %s not readable (stat errno %d, size %lld)", png.c_str(), e, static_cast<long long>(e == 0 ? st.st_size : -1));
 			}
 		}
 		if (data.empty()) {
@@ -746,13 +870,6 @@ void handle(int fd) {
 		const bool  ok  = !tid.empty() && (i < 0 || video_at(i, v));
 		std::string err = "Unknown game or video";
 		bool        big = ok && i >= 0 && refuse_4k(v.path, err); // bigger than 4K (notifies)
-		if (ok && !big && i >= 0 && tid != "NPXS40047" && clip_is_big(v.path)) {
-			// 4K plays as the main wallpaper or the PS Store only clip (one clip, never swapped), not per game.
-			big = true;
-			const std::string r = clip_res(v.path); // 4K or 2K
-			err = r + " videos work as the main wallpaper only. Pick a 1080p video for this game.";
-			notify((r + " works as the main wallpaper only").c_str());
-		}
 		if (ok && !big) {
 			set_game_background(tid, i < 0 ? std::string() : v.path);
 		}

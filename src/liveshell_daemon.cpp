@@ -39,6 +39,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include <signal.h>
@@ -73,6 +74,10 @@ __asm__(".section .rodata\n"
         ".incbin \"" LIVESHELL_SHELLUI_ELF "\"\n"
         ".previous\n");
 
+#ifdef LIVESHELL_RESEARCH_RETRO
+extern "C" int retro_start(void (*log_line)(const char* line), void (*notify_line)(const char* line)); // liveshell_retro.c
+#endif
+
 namespace liveshell {
 namespace {
 
@@ -94,6 +99,9 @@ constexpr const char* kOnionToolbox   = "/system_tmp/onionhen/ready/toolbox";
 constexpr int         kOnionCtrlPort  = 9048;
 constexpr off_t       kLogMaxSize     = 512 * 1024;
 constexpr long        kCrashWindowSec = 120;
+constexpr const char* kEarlyCrashFile = "/data/LiveShell/early_crash"; // liveshell.elf: the home screen crashed soon after we joined
+std::atomic<bool>     g_planned_restart{false}; // we restarted ShellUI ourselves: not a crash
+std::atomic<bool>     g_replaced{false};        // a newer LiveShell (another build) asked us to stop: no "stopped" notice
 // Runs next to OnionHEN (tested 2026-10-15): no "OnionHEN is running" refusal any more.
 constexpr bool        kOnionGuard     = false;
 
@@ -129,8 +137,11 @@ bool        g_store_only = false; // video only while the PS Store tile is highl
 bool        g_parallax   = false; // nudge the video when moving between home tiles
 bool        g_auto_match = false; // Auto-match (off by default, user)
 int         g_tint       = 0;     // Picture -> Colour: 0 neutral, 1 warm, 2 cool, 3 rose, 4 teal, 5 violet
+int         g_autonext   = 0;     // Auto-next (no playlist on): 0 off, 1 in order, 2 shuffle (issue #11)
+std::atomic<bool> g_ended{false};    // ShellUI: the main clip is about to end
+std::string       g_ended_clip;      // ... this one (shown path; guarded by g_ui_lock)
 int         g_launchfx   = 0;     // game launch effect: 0 fade, 1 dive, 2 pull back (ShellUI reads launchfx.txt)
-bool        g_resume     = false; // Resume after a game (experimental, off by default): ShellUI reads resume.txt: a note when Discover has wallpapers for a game without its own video
+bool        g_resume     = false; // Resume after a game (experimental, off by default): ShellUI reads resume.txt
 bool        g_game_running = false;
 bool        g_game_hide    = false; // option: no video on the home screen while a game is open (suspended)
 bool        g_game_open    = false; // a game is open, in front or suspended in the background
@@ -144,13 +155,64 @@ bool        g_injected = false; // the ShellUI module is running (it reacts to t
 
 // ---- small file helpers ----------------------------------------------------------------------
 
-bool write_text(const char* path, const std::string& text) {
-	const int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-	if (fd < 0) {
-		return false;
+// /system_tmp holds only ~33 files for the whole console (issue #14: OnionHEN + LiveShell ran out). The small
+// per-setting files ShellUI polls live in ONE file, opts.txt: "name<TAB>value" lines.
+constexpr const char* kOptsFile = "/system_tmp/liveshell/opts.txt";
+constexpr const char* kOptNames[] = {"dim.txt", "volume.txt", "menus.txt", "storeonly.txt", "looks.txt", "parallax.txt", "resume.txt", "launchfx.txt", "tint.txt", "gameopen.txt", "gamealive.txt", "window.txt"};
+
+const char* opt_name(const char* path) {
+	const char* base = strrchr(path, '/');
+	base             = base != nullptr ? base + 1 : path;
+	if (strncmp(path, "/system_tmp/liveshell/", 22) != 0) {
+		return nullptr;
 	}
-	const bool ok = write(fd, text.data(), text.size()) == static_cast<ssize_t>(text.size());
-	close(fd);
+	for (const char* n : kOptNames) {
+		if (strcmp(base, n) == 0) {
+			return n;
+		}
+	}
+	return nullptr;
+}
+
+bool write_raw(const char* path, const std::string& text, int& err) {
+	const int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666); // in place: no extra file slot needed
+	err          = fd < 0 ? errno : 0;
+	bool ok      = fd >= 0 && write(fd, text.data(), text.size()) == static_cast<ssize_t>(text.size());
+	if (fd >= 0) {
+		err = ok ? 0 : errno;
+		close(fd);
+	}
+	return ok;
+}
+
+// A failed write is logged once per file (issue #14: we could not tell whether it worked).
+bool write_text(const char* path, const std::string& text) {
+	int         err  = 0;
+	bool        ok   = false;
+	const char* name = opt_name(path);
+	if (name != nullptr) {
+		static std::mutex                         olock;
+		static std::map<std::string, std::string> opts;
+		std::lock_guard<std::mutex>               g(olock);
+		std::string value = text.substr(0, text.find('\n'));
+		opts[name]        = value;
+		std::string all;
+		for (const auto& kv : opts) {
+			all += kv.first + "\t" + kv.second + "\n";
+		}
+		ok   = write_raw(kOptsFile, all, err);
+		path = kOptsFile;
+	} else {
+		ok = write_raw(path, text, err);
+	}
+	if (!ok) {
+		static std::mutex            lock;
+		static std::set<std::string> told;
+		std::lock_guard<std::mutex>  g(lock);
+		if (told.insert(path).second) {
+			log("write failed: %s (errno %d%s)", path, err, err == ENOSPC ? ": /system_tmp is full" : "");
+		}
+	}
 	return ok;
 }
 
@@ -410,10 +472,12 @@ void load_config() {
 			g_tint = std::max(0, std::min(5, atoi(line.c_str() + 5)));
 		} else if (line.rfind("launchfx=", 0) == 0) {
 			g_launchfx = std::max(0, std::min(2, atoi(line.c_str() + 9)));
+		} else if (line.rfind("autonext=", 0) == 0) {
+			g_autonext = std::max(0, std::min(2, atoi(line.c_str() + 9)));
 		} else if (line.rfind("resume=", 0) == 0) {
 			g_resume = line.substr(7) == "1";
 		} else if (line.rfind("automatch=", 0) == 0) {
-			g_auto_match = line.substr(10) == "1";
+			g_auto_match = false; // Auto-match: no switch since v1.7.0, parked for a later release (user) - off even if it was on
 		} else if (line.rfind("menuhide=", 0) == 0) {
 			g_menu_hide = line.substr(9) != "0";
 		} else if (line.rfind("storeonly=", 0) == 0) {
@@ -441,7 +505,7 @@ void load_config() {
 
 void save_config() {
 	write_text(kConfigFile, std::string("enabled=") + (g_enabled ? "1" : "0") + "\nvideo=" + g_current + "\ndim=" + std::to_string(g_dim) + "\nvolume=" + std::to_string(g_volume) + "\nlooks=" + looks_text() +
-	                            "\nshuffle=" + (g_shuffle ? "1" : "0") + "\nmainvideo=1\npergameonly=" + (g_main_video ? "0" : "1") + "\ngamevideos=" + (g_game_videos ? "1" : "0") + "\ngamepause=" + (g_game_pause ? "1" : "0") + "\nmenuhide=" + (g_menu_hide ? "1" : "0") + "\nstoreonly=" + (g_store_only ? "1" : "0") + "\nparallax=" + (g_parallax ? "1" : "0") + "\nautomatch=" + (g_auto_match ? "1" : "0") + "\nresume=" + (g_resume ? "1" : "0") + "\nlaunchfx=" + std::to_string(g_launchfx) + "\ntint=" + std::to_string(g_tint) + "\noffusers=" + g_off_users + "\ngamehide=" + (g_game_hide ? "1" : "0") + "\n");
+	                            "\nshuffle=" + (g_shuffle ? "1" : "0") + "\nmainvideo=1\npergameonly=" + (g_main_video ? "0" : "1") + "\ngamevideos=" + (g_game_videos ? "1" : "0") + "\ngamepause=" + (g_game_pause ? "1" : "0") + "\nmenuhide=" + (g_menu_hide ? "1" : "0") + "\nstoreonly=" + (g_store_only ? "1" : "0") + "\nparallax=" + (g_parallax ? "1" : "0") + "\nautomatch=" + (g_auto_match ? "1" : "0") + "\nresume=" + (g_resume ? "1" : "0") + "\nlaunchfx=" + std::to_string(g_launchfx) + "\nautonext=" + std::to_string(g_autonext) + "\ntint=" + std::to_string(g_tint) + "\noffusers=" + g_off_users + "\ngamehide=" + (g_game_hide ? "1" : "0") + "\n");
 }
 
 // ---- telling ShellUI what to play ------------------------------------------------------------
@@ -506,6 +570,57 @@ int open_ui_port() {
 	return s;
 }
 
+#ifdef LIVESHELL_RESEARCH_DUMP
+// RESEARCH BUILD ONLY: the ShellUI module's assembly images (UDP 9052: 64-byte name, offset, total, data)
+// -> /data/LiveShell/dump/<name>.dll; "<name>: complete" in the log once every byte came.
+void* dump_rx_thread(void*) {
+	mkdir("/data/LiveShell/dump", 0777);
+	const int   s = socket(AF_INET, SOCK_DGRAM, 0);
+	sockaddr_in a {};
+	a.sin_family      = AF_INET;
+	a.sin_port        = htons(9052);
+	a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	int big = 16 << 20;
+	setsockopt(s, SOL_SOCKET, SO_RCVBUF, &big, sizeof(big));
+	if (s < 0 || bind(s, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0) {
+		log("dump: bind 9052 failed (errno %d)", errno);
+		return nullptr;
+	}
+	static char             buf[72 + 8192];
+	std::map<std::string, uint64_t> got;
+	while (g_running) {
+		const ssize_t n = recv(s, buf, sizeof(buf), 0);
+		if (n <= 72) {
+			continue;
+		}
+		char name[65] = {};
+		memcpy(name, buf, 64);
+		for (char* c = name; *c; ++c) {
+			if (*c == '/' || *c == '\\') {
+				*c = '_';
+			}
+		}
+		uint32_t off = 0, total = 0;
+		memcpy(&off, buf + 64, 4);
+		memcpy(&total, buf + 68, 4);
+		const std::string path = std::string("/data/LiveShell/dump/") + name + ".dll";
+		const int         fd   = open(path.c_str(), O_WRONLY | O_CREAT, 0666);
+		if (fd < 0) {
+			continue;
+		}
+		(void)pwrite(fd, buf + 72, static_cast<size_t>(n - 72), off);
+		close(fd);
+		uint64_t& g = got[name];
+		const uint64_t before = g;
+		g += static_cast<uint64_t>(n - 72);
+		if (before < total && g >= total) {
+			log("dump: %s complete (%u bytes)", name, total);
+		}
+	}
+	return nullptr;
+}
+#endif
+
 void* ui_thread(void*) {
 	int       s  = -1, fails = 0, epoch = net_epoch(); // reopened after rest mode (see power_thread)
 	const int lf = open(kUiLogFile, O_WRONLY | O_CREAT | O_TRUNC, 0666);
@@ -543,7 +658,11 @@ void* ui_thread(void*) {
 			continue;
 		}
 		g_ui_bytes += n;
-		if (buf[0] == 'S' || buf[0] == 'F') {
+		if (buf[0] == 'E') { // the main clip is about to end (Next video when one ends)
+			std::lock_guard<std::mutex> lock(g_ui_lock);
+			g_ended_clip.assign(buf + 1, static_cast<size_t>(n - 1));
+			g_ended = true;
+		} else if (buf[0] == 'S' || buf[0] == 'F') {
 			std::lock_guard<std::mutex> lock(g_ui_lock);
 			(buf[0] == 'S' ? g_ui_status : g_ui_focus).assign(buf + 1, static_cast<size_t>(n - 1));
 			(buf[0] == 'S' ? g_ui_status_set : g_ui_focus_set) = true;
@@ -611,8 +730,9 @@ bool on_now() {
 }
 
 bool apply_locked(std::string& error) {
+	write_fast_map(); // first: a changed setting reaches the tiles at once (apply_inner can wait ~8 s for a busy home screen)
 	const bool ok = apply_inner(error);
-	write_fast_map();
+	write_fast_map(); // again: apply_inner may have changed what is mounted
 	return ok;
 }
 
@@ -835,9 +955,20 @@ void* power_thread(void*) {
 			continue;
 		}
 		const unsigned state = static_cast<unsigned>(bits & 0xffff);
+		// Every change, to the ms (rest / wake problems: which codes, when).
+		static unsigned last_state = 0;
+		if (state != last_state) {
+			timespec ts {};
+			clock_gettime(CLOCK_MONOTONIC, &ts);
+			log("power state %u -> %u (t=%ld.%03ld s)", last_state, state, static_cast<long>(ts.tv_sec), ts.tv_nsec / 1000000);
+			last_state = state;
+		}
 		if (state == 500 || state == 300) {
 			if (!sleeping) {
 				log("rest: going to rest mode (%u)", state);
+				// Rest mode ends ShellUI: not a crash. Without this the crash guard of a video started < 20 s
+				// before stayed, and after waking the video did not start ("last attempt did not survive").
+				unlink("/system_tmp/liveshell/video_trying");
 				g_rest_seen = time(nullptr);
 			}
 			sleeping   = true;
@@ -977,10 +1108,172 @@ void* stop_thread(void*) {
 			close(c);
 			g_stop_requested = true;
 			g_running        = false;
-			log("stop command received");
+			g_replaced       = got >= 8 && memcmp(hello, "handover", 8) == 0; // another build replaces us
+			log(g_replaced ? "stop: a newer LiveShell (another build) replaces this one" : "stop command received");
 		}
 	}
 	close(s);
+	return nullptr;
+}
+
+// A HEN's toolbox (etaHEN / OnionHEN) must be in the home screen before LiveShell hooks it (etaHEN checks that the
+// functions are untouched; both clashed with a LiveShell injecting at the same moment). After rest mode, and at
+// the first start too (Payload Manager autoload: LiveShell right after the HEN, issue #16). first: a toolbox that
+// is already in the home screen means no wait at all.
+void wait_for_hen_toolboxes(bool first) {
+	// etaHEN running: its toolbox checks that the home screen's functions are untouched before it hooks
+	// them. After rest mode LiveShell was back first, the check failed ("Failed to load the etaHEN
+	// toolbox") and the home screen crashed. Wait until its toolbox is in the new one (its pid file
+	// /system_tmp/etahen-<fw>-toolbox.pid shows it), max 45 s, then 5 s - as at boot, where etaHEN is first.
+	// etaHEN runs = its service socket answers (the socket file stays after it exits).
+	bool eta = false;
+	{
+		const int u = socket(AF_UNIX, SOCK_STREAM, 0);
+		sockaddr_un a {};
+		a.sun_family = AF_UNIX;
+		snprintf(a.sun_path, sizeof(a.sun_path), "%s", "/system_tmp/etaHEN_crit_service");
+		eta = u >= 0 && connect(u, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0;
+		if (u >= 0) {
+			close(u);
+		}
+	}
+	if (eta) {
+		const pid_t ui = onion_find_pid("SceShellUI");
+		auto toolbox_in = [&]() {
+			bool in = false;
+			if (DIR* d = opendir("/system_tmp")) {
+				while (dirent* e = readdir(d)) {
+					const std::string n = e->d_name;
+					if (n.rfind("etahen-", 0) == 0 && n.size() > 12 && n.compare(n.size() - 12, 12, "-toolbox.pid") == 0) {
+						in = in || read_pid_file(("/system_tmp/" + n).c_str()) == ui;
+					}
+				}
+				closedir(d);
+			}
+			return in;
+		};
+		if (!(first && toolbox_in())) {
+			int w = 0;
+			while (g_running && w < 90 && ui > 0 && !toolbox_in()) {
+				usleep(500 * 1000);
+				++w;
+			}
+			log("etaHEN: its toolbox %s in the home screen, injecting in 5 s", toolbox_in() ? "is online" : "did not come (45 s)");
+			sleep(5);
+		}
+	}
+	// OnionHEN / HyperHEN running: its toolbox goes into the new home screen too. Injecting while it is still
+	// setting up there crashed the home screen once ("software system error" after waking, LiveShell
+	// in 2 s after "Toolbox online"); with HyperHEN it ended in "hook failed" (issue #20: HyperHEN is
+	// built on OnionHEN, same ready files, its own folder). Wait until its toolbox is online in this one
+	// (max 45 s), then 5 s. Only when that HEN really runs: its ready file holds its pid and stays after it exits.
+	struct Hen {
+		const char* name;
+		const char* daemon;
+		const char* toolbox;
+	};
+	static const Hen hens[] = {
+		{"OnionHEN", "/system_tmp/onionhen/ready/daemon", kOnionToolbox},
+		{"HyperHEN", "/system_tmp/hyperhen/ready/daemon", "/system_tmp/hyperhen/ready/toolbox"},
+	};
+	for (const Hen& h : hens) {
+		const long hen_pid = read_pid_file(h.daemon);
+		if (hen_pid <= 0 || kill(static_cast<pid_t>(hen_pid), 0) != 0) {
+			continue;
+		}
+		const pid_t ui = onion_find_pid("SceShellUI");
+		if (first && ui > 0 && read_pid_file(h.toolbox) == ui) {
+			continue;
+		}
+		int w = 0;
+		while (g_running && w < 90 && ui > 0 && read_pid_file(h.toolbox) != ui) {
+			usleep(500 * 1000);
+			++w;
+		}
+		log("%s: its toolbox %s in the home screen, injecting in 5 s", h.name,
+		    ui > 0 && read_pid_file(h.toolbox) == ui ? "is online" : "did not come (45 s)");
+		sleep(5);
+	}
+}
+
+// Self-recovery (issue #14): the payload wants a video (video.txt holds a path) but ShellUI keeps saying
+// "stopped". What the user's off / on toggle did: "off", a moment, the path again. At most 3 in 5 minutes.
+void* recovery_thread(void*) {
+	int    stuck = 0;
+	time_t tries[3] {};
+	while (g_running) {
+		sleep(2);
+		std::string want = read_text(kPathFile, 1024);
+		want             = want.substr(0, want.find('\n'));
+		const bool wants = want.rfind("/", 0) == 0 || want.rfind("switch:/", 0) == 0;
+		bool live;
+		{
+			std::lock_guard<std::mutex> lock(g_ctl);
+			live = g_injected && !g_game_open; // a game open: 4K / Hide while a game is open start nothing on purpose
+		}
+		{
+			// Only the home screen we are really in counts (after a restart the new one has no module yet).
+			const pid_t ui = onion_find_pid("SceShellUI");
+			live           = live && ui > 0 && read_pid_file(kOurMarker) == ui;
+		}
+		// An old LiveShell module (another build, parked by a soft stop next to OnionHEN) already holds the home
+		// screen's hook: the new one could not start. Restart the home screen once and inject fresh.
+		// Also: a module we reuse ("already injected") that never reports - one that failed before - is dead.
+		static bool hook_fixed = false;
+		static int  silent     = 0;
+		silent = live && !g_sleeping && shellui_status().empty() ? silent + 1 : 0;
+		if (!hook_fixed && (shellui_status().rfind("failed hook", 0) == 0 || silent >= 6)) { // 12 s: a working one reports every 2 s
+			hook_fixed = true;
+			// Never with OnionHEN running: restarting the home screen throws its toolbox out too (it came back
+			// after rest mode, "toolbox restart", then a crash). There the hook has to work next to it.
+			const long onion = read_pid_file("/system_tmp/onionhen/ready/daemon");
+			if (onion > 0 && kill(static_cast<pid_t>(onion), 0) == 0) {
+				log("the home screen's LiveShell module %s, OnionHEN runs: no home screen restart (it would take OnionHEN's toolbox down)",
+				    silent >= 6 ? "never answers" : "could not hook");
+				continue;
+			}
+			log("the home screen's LiveShell module %s: restarting the home screen once to start clean",
+			    silent >= 6 ? "never answers" : "could not hook (an old module holds it)");
+			g_planned_restart = true;
+			restart_shellui();
+			continue;
+		}
+		if (!live || g_sleeping || !wants || shellui_status().rfind("stopped", 0) != 0) {
+			stuck = 0;
+			continue;
+		}
+		if (++stuck < 4) { // 8 s
+			continue;
+		}
+		stuck            = 0;
+		const time_t now = time(nullptr);
+		int          n   = 0;
+		for (const time_t t : tries) {
+			n += t != 0 && now - t < 300;
+		}
+		if (n >= 3) {
+			continue; // it did not help: no loop
+		}
+		for (time_t& t : tries) {
+			if (t == 0 || now - t >= 300) {
+				t = now;
+				break;
+			}
+		}
+		const std::string path = want.rfind("switch:", 0) == 0 ? want.substr(7) : want;
+		log("recovery: video.txt asks for %s but the home screen says stopped: off, then again", path.c_str());
+		{
+			std::lock_guard<std::mutex> lock(g_ctl);
+			write_text(kPathFile, "off\n");
+		}
+		sleep(2);
+		{
+			std::lock_guard<std::mutex> lock(g_ctl);
+			if (read_text(kPathFile, 1024).rfind("off", 0) == 0) { // nothing else asked meanwhile
+				write_text(kPathFile, path + "\n");
+			}
+		}
+	}
 	return nullptr;
 }
 
@@ -1223,6 +1516,7 @@ State get_state() {
 		st.auto_match = g_auto_match;
 		st.resume     = g_resume;
 		st.launchfx   = g_launchfx;
+		st.autonext   = g_autonext;
 		st.pl_bak     = exists(kPlaylistsBak);
 		st.tint       = g_tint;
 		for (const Playlist& p : g_playlists) {
@@ -1255,15 +1549,7 @@ bool select_video(const std::string& path, std::string& error) {
 	g_cycle_at = time(nullptr);
 	save_user_wall(path); // this user's own wallpaper
 	save_config(); // g_override stays: a highlighted game's own clip wins over the main video
-	if (g_main_video && clip_is_big(path)) {
-		g_override.clear(); // 4K main: every tile shows it (videos per game pause)
-		if (!was_4k && g_game_videos && !read_text("/data/LiveShell/games.txt", 64 * 1024).empty()) {
-			notify((clip_res(path) + " main wallpaper: videos per game are paused").c_str()); // 4K or 2K
-			notify("They come back with a 1080p main wallpaper.");
-		}
-	} else if (g_main_video && was_4k && g_game_videos && !read_text("/data/LiveShell/games.txt", 64 * 1024).empty()) {
-		notify("Videos per game are back");
-	}
+	(void)was_4k; // v1.7.0: a 4K main no longer pauses videos per game (kept players + 4K warm-up)
 	return apply_locked(error);
 }
 
@@ -1306,6 +1592,13 @@ void set_tint(int t) {
 	save_config();
 	write_text("/system_tmp/liveshell/tint.txt", std::to_string(g_tint) + "\n");
 	log("colour: %d", g_tint);
+}
+
+void set_autonext(int mode) {
+	std::lock_guard<std::mutex> lock(g_ctl);
+	g_autonext = std::max(0, std::min(2, mode));
+	save_config();
+	log("auto-next: %s", g_autonext == 0 ? "off" : g_autonext == 1 ? "in order" : "shuffle");
 }
 
 void set_launchfx(int mode) {
@@ -1362,7 +1655,7 @@ std::vector<Playlist> parse_playlists(const std::string& text) {
 				p.name = "Playlist";
 			}
 			p.on      = f[2] == "1";
-			p.every   = std::max(1, std::min(240, atoi(f[3].c_str())));
+			p.every   = f[3] == "0" ? 0 : std::max(1, std::min(240, atoi(f[3].c_str()))); // 0: when each video ends
 			p.shuffle = f[4] == "1";
 			out.push_back(p);
 		} else if (f[0] == "V" && f.size() >= 2 && !out.empty() && out.back().videos.size() < 5000 &&
@@ -1575,6 +1868,395 @@ std::string user_avatar(int id) {
 	return read_text(path, 2 * 1024 * 1024);
 }
 
+// ---- animated avatars (v1.6.0) --------------------------------------------------------------
+// A user's animated avatar: /data/LiveShell/video/.avatars/<id>.png (an animated PNG; the ShellUI module shows it
+// in place of the PSN avatar) and <id>_still.png, its first picture as a plain PNG (the same file without the
+// animation chunks: shown at once while the animation decodes). The video folder is mounted where ShellUI can
+// read it; its video list takes only .mp4 files.
+constexpr const char* kAvatarDir = "/data/LiveShell/video/.avatars"; // hidden: the files LiveShell shows, one per user
+
+std::string avatar_path(int id, bool still) {
+	char path[96];
+	snprintf(path, sizeof(path), "%s/%u%s.png", kAvatarDir, static_cast<unsigned>(id), still ? "_still" : "");
+	return path;
+}
+
+bool has_anim_avatar(int id) {
+	struct stat st {};
+	return stat(avatar_path(id, false).c_str(), &st) == 0 && st.st_size > 64;
+}
+
+bool write_file_atomic(const std::string& path, const std::string& data) {
+	const std::string tmp = path + ".part";
+	const int         fd  = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+	if (fd < 0) {
+		return false;
+	}
+	const bool ok = write(fd, data.data(), data.size()) == static_cast<ssize_t>(data.size());
+	close(fd);
+	if (!ok || rename(tmp.c_str(), path.c_str()) != 0) {
+		unlink(tmp.c_str());
+		return false;
+	}
+	return true;
+}
+
+bool save_avatar(int id, const std::string& png, std::string& error) {
+	std::string still, anim;
+	error.clear();
+	if (id <= 0) {
+		error = "No such user";
+		return false;
+	}
+	// rebuilt: whole frames, a centred square (partial frames left black gaps on the PS5), see liveshell_apng.cpp
+	const time_t t0 = time(nullptr);
+	if (!apng_rebuild(png, anim, still, error)) {
+		return false;
+	}
+	mkdir(kAvatarDir, 0777);
+	// the still first: the ShellUI module serves it until the animation is decoded
+	if (!write_file_atomic(avatar_path(id, true), still) || !write_file_atomic(avatar_path(id, false), anim)) {
+		error = "Cannot write to " + std::string(kAvatarDir);
+		return false;
+	}
+	log("avatar: user %d, %zu bytes -> %zu (still %zu), %ld s", id, png.size(), anim.size(), still.size(), static_cast<long>(time(nullptr) - t0));
+	return true;
+}
+
+// Which library file a user's avatar came from (<id>.src next to it): the Avatar page marks it "In use".
+std::string avatar_src_file(int id) {
+	char path[96];
+	snprintf(path, sizeof(path), "%s/%u.src", kAvatarDir, static_cast<unsigned>(id));
+	return path;
+}
+
+void note_avatar_src(int id, const std::string& from) {
+	write_file_atomic(avatar_src_file(id), from);
+}
+
+bool delete_avatar(int id) {
+	unlink(avatar_src_file(id).c_str());
+	const bool a = unlink(avatar_path(id, false).c_str()) == 0;
+	const bool b = unlink(avatar_path(id, true).c_str()) == 0;
+	log("avatar: user %d removed", id);
+	return a || b;
+}
+
+std::string anim_avatar(int id) {
+	return read_text(avatar_path(id, false).c_str(), 16 * 1024 * 1024);
+}
+
+// The APNG library (the page's "Choose Avatar"): /data/LiveShell/avatar (uploads land there) and on USB a folder
+// called liveshell (any capitalisation) or its "avatar" subfolder. Only animated PNGs (an acTL chunk near the start).
+constexpr const char* kApngDir = "/data/LiveShell/avatar";
+// Animated tiles have their own library (user, v1.7.0): /data/LiveShell/icons, on USB liveshell/icons or icons.
+constexpr const char* kIconDir = "/data/LiveShell/icons";
+
+// An animated PNG (an acTL chunk near the start) or a GIF: what "Choose Avatar" lists.
+bool is_apng(const std::string& path) {
+	const size_t l   = path.size();
+	auto         ext = [&](const char* e) { const size_t k = strlen(e); return l > k && strcasecmp(path.c_str() + l - k, e) == 0; };
+	if (ext(".gif")) {
+		const std::string head = read_text(path.c_str(), 16);
+		return head.compare(0, 4, "GIF8") == 0;
+	}
+	if (!ext(".png") && !ext(".apng")) {
+		return false;
+	}
+	const std::string head = read_text(path.c_str(), 4096);
+	return head.size() > 40 && head.compare(1, 3, "PNG") == 0 && head.find("acTL") != std::string::npos;
+}
+
+bool apng_allowed(const std::string& path) {
+	return path.find("..") == std::string::npos &&
+	       (path.rfind(std::string(kApngDir) + "/", 0) == 0 || path.rfind(std::string(kIconDir) + "/", 0) == 0 ||
+	        path.rfind("/data/LiveShell/video/.tiles/", 0) == 0 ||
+	        path.rfind("/mnt/usb", 0) == 0) && is_apng(path);
+}
+
+std::string apngs_json(bool icons) {
+	std::string out;
+	auto js = [](const std::string& v) { // a JSON string (paths and names: no control characters)
+		std::string q = "\"";
+		for (const char c : v) {
+			if (c == '"' || c == '\\') {
+				q += '\\';
+			}
+			if (static_cast<unsigned char>(c) >= 0x20) {
+				q += c;
+			}
+		}
+		return q + "\"";
+	};
+	auto scan = [&](const std::string& folder, const std::string& where) {
+		DIR* dir = opendir(folder.c_str());
+		if (dir == nullptr) {
+			return;
+		}
+		std::vector<std::string> names;
+		while (dirent* e = readdir(dir)) {
+			if (e->d_name[0] != '.' && is_apng(folder + "/" + e->d_name)) {
+				names.push_back(e->d_name);
+			}
+		}
+		closedir(dir);
+		std::sort(names.begin(), names.end());
+		for (const std::string& n : names) {
+			struct stat st {};
+			const std::string path = folder + "/" + n;
+			stat(path.c_str(), &st);
+			out += std::string(out.empty() ? "" : ",") + "{\"path\":" + js(path) + ",\"name\":" +
+			       js(n.substr(0, n.rfind('.'))) + ",\"where\":" + js(where) + ",\"size\":" +
+			       std::to_string(static_cast<long long>(st.st_size)) + "}";
+		}
+	};
+	auto subdir = [](const std::string& parent, const char* want) {
+		std::string found;
+		if (DIR* dir = opendir(parent.c_str())) {
+			while (dirent* e = readdir(dir)) {
+				if (strcasecmp(e->d_name, want) == 0) {
+					found = parent + "/" + e->d_name;
+					break;
+				}
+			}
+			closedir(dir);
+		}
+		return found;
+	};
+	if (icons) { // animated tiles: /data/LiveShell/icons, USB liveshell/icons/ and icons/
+		mkdir(kIconDir, 0777);
+		scan(kIconDir, "Internal");
+		for (int i = 0; i < 8; ++i) {
+			const std::string drive = "/mnt/usb" + std::to_string(i), where = "USB " + std::to_string(i + 1);
+			const std::string root  = subdir(drive, "liveshell");
+			const std::string sub   = root.empty() ? std::string() : subdir(root, "icons");
+			if (!sub.empty()) {
+				scan(sub, where);
+			}
+			const std::string top = subdir(drive, "icons");
+			if (!top.empty()) {
+				scan(top, where);
+			}
+		}
+		return "[" + out + "]";
+	}
+	scan(kApngDir, "Internal");
+	for (int i = 0; i < 8; ++i) { // USB: liveshell/, liveshell/avatar/ and avatar/ at the top of the drive
+		const std::string drive = "/mnt/usb" + std::to_string(i), where = "USB " + std::to_string(i + 1);
+		const std::string root  = subdir(drive, "liveshell");
+		if (!root.empty()) {
+			scan(root, where);
+			const std::string sub = subdir(root, "avatar");
+			if (!sub.empty()) {
+				scan(sub, where);
+			}
+		}
+		const std::string top = subdir(drive, "avatar");
+		if (!top.empty()) {
+			scan(top, where);
+		}
+	}
+	return "[" + out + "]";
+}
+
+// The pickers' previews: a 128 px copy of a library file, still moving (the originals are up to 16 MB each - a
+// grid of them made the picker slow). Made once, kept in /data/LiveShell/.thumbs/<hash>_<file time>.png;
+// one at a time (each one decodes the whole animation).
+constexpr const char* kThumbDir = "/data/LiveShell/.thumbs";
+std::mutex            g_thumb_lock;
+
+std::string apng_thumb(const std::string& path) {
+	struct stat st {};
+	if (!apng_allowed(path) || stat(path.c_str(), &st) != 0) {
+		return std::string();
+	}
+	uint32_t hash = 2166136261u;
+	for (const char c : path) {
+		hash = (hash ^ static_cast<unsigned char>(c)) * 16777619u;
+	}
+	char cached[128];
+	snprintf(cached, sizeof(cached), "%s/%08x_%ld.png", kThumbDir, hash, static_cast<long>(st.st_mtime));
+	std::lock_guard<std::mutex> lock(g_thumb_lock);
+	std::string                 out = read_text(cached, 16 * 1024 * 1024);
+	if (!out.empty()) {
+		return out;
+	}
+	static std::set<std::string> failed; // path + file time: not decoded again until the file changes
+	const std::string            key = std::string(cached);
+	if (failed.count(key) != 0) {
+		return std::string();
+	}
+	std::string still, error;
+	if (!apng_rebuild(read_text(path.c_str(), 64 * 1024 * 1024), out, still, error, 128)) { // tiles can pass 16 MB
+		log("thumb: %s: %s", path.c_str(), error.c_str());
+		failed.insert(key);
+		return std::string();
+	}
+	mkdir(kThumbDir, 0777);
+	write_file_atomic(cached, out);
+	return out;
+}
+
+std::string read_apng(const std::string& path) {
+	return apng_allowed(path) ? read_text(path.c_str(), 16 * 1024 * 1024) : std::string();
+}
+
+bool set_avatar_from(int id, const std::string& path, std::string& error) {
+	const std::string png = read_apng(path);
+	if (png.empty()) {
+		error = "That APNG is not there any more";
+		return false;
+	}
+	if (!save_avatar(id, png, error)) {
+		return false;
+	}
+	note_avatar_src(id, path);
+	return true;
+}
+
+// ---- animated game tiles (v1.7.0) -----------------------------------------------------------
+// /data/LiveShell/video/.tiles/<TITLE ID>.png: an animation from the APNG library, rebuilt (whole frames, centred
+// square, at most 512 px like the PS5's own icons; any number of games) - the ShellUI module shows it in place
+// of that game's tile icon. <ID>.src = the library file it came from (the picker marks it "In use").
+constexpr const char* kTilesDir = "/data/LiveShell/video/.tiles";
+
+bool tile_id_ok(const std::string& tid) {
+	if (tid.size() != 9) {
+		return false;
+	}
+	for (const char c : tid) {
+		if (!isalnum(static_cast<unsigned char>(c))) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// Already tile-ready (what make_tile.py / make_icons.py write): a square APNG of at most 512 px, 8-bit RGB / RGBA,
+// not interlaced, every frame the whole picture (no offset, no dispose, "source" blend), every frame fitting the
+// home screen's memory like the converter's own. Then it is used as it is: no 2-7 s rebuild on the PS5 (which also
+// made the file bigger, so the home screen took longer to show it).
+bool apng_ready(const std::string& png) {
+	auto be32 = [&](size_t at) {
+		return static_cast<uint32_t>(static_cast<unsigned char>(png[at])) << 24 | static_cast<uint32_t>(static_cast<unsigned char>(png[at + 1])) << 16 |
+		       static_cast<uint32_t>(static_cast<unsigned char>(png[at + 2])) << 8 | static_cast<uint32_t>(static_cast<unsigned char>(png[at + 3]));
+	};
+	if (png.size() < 64 || png.compare(1, 3, "PNG") != 0 || png.compare(12, 4, "IHDR") != 0) {
+		return false;
+	}
+	const uint32_t w = be32(16), h = be32(20);
+	const int      depth = static_cast<unsigned char>(png[24]), type = static_cast<unsigned char>(png[25]), lace = static_cast<unsigned char>(png[28]);
+	if (w != h || w == 0 || w > 512 || depth != 8 || (type != 2 && type != 6) || lace != 0) {
+		return false;
+	}
+	size_t   at     = 8;
+	uint32_t frames = 0;
+	bool     actl   = false;
+	while (at + 12 <= png.size()) {
+		const uint32_t len = be32(at);
+		if (at + 12 + static_cast<size_t>(len) > png.size()) {
+			return false;
+		}
+		const std::string kind = png.substr(at + 4, 4);
+		if (kind == "acTL") {
+			actl = true;
+		} else if (kind == "fcTL") {
+			if (len < 26 || be32(at + 12) == 0xFFFFFFFFu || be32(at + 12 + 4) != w || be32(at + 12 + 8) != h || be32(at + 12 + 12) != 0 ||
+			    be32(at + 12 + 16) != 0 || png[at + 12 + 24] != 0 || png[at + 12 + 25] != 0) {
+				return false; // a part of the picture, disposed or blended: the converter makes whole frames of it
+			}
+			++frames;
+		} else if (kind == "IEND") {
+			break;
+		}
+		at += 12 + len;
+	}
+	return actl && frames > 0 && static_cast<uint64_t>(w) * h * 4 * frames <= (64ull << 20);
+}
+
+bool set_tile_from(const std::string& tid, const std::string& path, std::string& error) {
+	if (!tile_id_ok(tid)) {
+		error = "No such game";
+		return false;
+	}
+	const std::string png = read_apng(path);
+	if (png.empty()) {
+		error = "That animation is not there any more";
+		return false;
+	}
+	std::string  anim, still;
+	const time_t t0    = time(nullptr);
+	const bool   as_is = apng_ready(png);
+	if (as_is) {
+		anim = png;
+	} else if (!apng_rebuild(png, anim, still, error)) {
+		return false;
+	}
+	mkdir(kTilesDir, 0777);
+	const std::string base = std::string(kTilesDir) + "/" + tid;
+	if (!write_file_atomic(base + ".png", anim)) {
+		error = "Cannot write to " + std::string(kTilesDir);
+		return false;
+	}
+	write_file_atomic(base + ".src", path);
+	log("tile: %s <- %s, %zu bytes -> %zu%s, %ld s", tid.c_str(), path.c_str(), png.size(), anim.size(), as_is ? " (tile-ready: as it is)" : "",
+	    static_cast<long>(time(nullptr) - t0));
+	return true;
+}
+
+bool delete_tile(const std::string& tid) {
+	if (!tile_id_ok(tid)) {
+		return false;
+	}
+	const std::string base = std::string(kTilesDir) + "/" + tid;
+	unlink((base + ".src").c_str());
+	const bool ok = unlink((base + ".png").c_str()) == 0;
+	log("tile: %s back to its own icon", tid.c_str());
+	return ok;
+}
+
+std::string tiles_json() {
+	std::string out;
+	if (DIR* d = opendir(kTilesDir)) {
+		while (dirent* e = readdir(d)) {
+			const std::string n = e->d_name;
+			if (n.size() != 13 || n.compare(9, 4, ".png") != 0 || !tile_id_ok(n.substr(0, 9))) {
+				continue;
+			}
+			std::string src = "\"";
+			for (const char c : read_text((std::string(kTilesDir) + "/" + n.substr(0, 9) + ".src").c_str(), 1024)) {
+				if (c == '"' || c == '\\') {
+					src += '\\';
+				}
+				if (static_cast<unsigned char>(c) >= 0x20) {
+					src += c;
+				}
+			}
+			out += std::string(out.empty() ? "" : ",") + "\"" + n.substr(0, 9) + "\":" + src + "\"";
+		}
+		closedir(d);
+	}
+	return "{" + out + "}";
+}
+
+// An uploaded APNG / GIF goes into the library too (name from the page, plain characters only).
+std::string keep_apng(const std::string& name, const std::string& png, bool icons) {
+	std::string n;
+	for (const char c : name) {
+		n += isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_' ? c : c == ' ' ? '-' : '\0';
+		if (!n.empty() && n.back() == '\0') {
+			n.pop_back();
+		}
+	}
+	if (n.empty() || n.size() > 80) {
+		n = (icons ? "icon-" : "avatar-") + std::to_string(static_cast<long long>(time(nullptr)));
+	}
+	const char* dir = icons ? kIconDir : kApngDir;
+	mkdir(dir, 0777);
+	const std::string path = std::string(dir) + "/" + n + (png.compare(0, 4, "GIF8") == 0 ? ".gif" : ".png");
+	return write_file_atomic(path, png) ? path : std::string();
+}
+
 // Every account on the console (user_list.dat), with its name: Settings -> Users lists them all from the start.
 void load_all_users() {
 	const std::string list = read_text("/system_data/priv/home/user_list.dat", 4096);
@@ -1659,7 +2341,13 @@ std::string users_json() {
 				name += ch == '"' || ch == '\\' ? ' ' : ch;
 			}
 			out += std::string(out.empty() ? "" : ",") + "{\"id\":" + std::to_string(id) + ",\"name\":\"" + name + "\",\"on\":" +
-			       (user_is_off(id) ? "false" : "true") + ",\"now\":" + (id == now ? "true" : "false") + "}";
+			       (user_is_off(id) ? "false" : "true") + ",\"now\":" + (id == now ? "true" : "false") +
+			       ",\"anim\":" + (has_anim_avatar(id) ? "true" : "false");
+			std::string src;
+			for (const char ch : read_text(avatar_src_file(id).c_str(), 400)) {
+				src += ch == '"' || ch == '\\' || static_cast<unsigned char>(ch) < 0x20 ? '_' : ch;
+			}
+			out += ",\"avsrc\":\"" + (has_anim_avatar(id) ? src : std::string()) + "\"}";
 		}
 		if (end == std::string::npos) {
 			break;
@@ -1712,7 +2400,7 @@ bool set_option(const std::string& key, bool on, std::string& error) {
 		write_text(kMenusFile, on ? "1\n" : "0\n");
 	} else if (key == "storeonly") {
 		// PS Store only: ShellUI hides (fades + mutes) the video on every other tile; per-game videos
-		// are not used. The player keeps running, so coming back to the PS Store tile is instant.
+		// are not used. The player keeps running, so coming back to the Store is instant.
 		g_store_only = on;
 		write_text(kStoreOnlyFile, on ? "1\n" : "0\n");
 		g_focus_recheck = true;
@@ -1811,6 +2499,7 @@ bool reset_settings(std::string& error) {
 	g_resume     = false;
 	write_text("/system_tmp/liveshell/resume.txt", "0\n");
 	g_launchfx   = 0;
+	g_autonext   = 0;
 	write_text("/system_tmp/liveshell/launchfx.txt", "0\n");
 	g_tint       = 0;
 	write_text("/system_tmp/liveshell/tint.txt", "0\n");
@@ -2282,15 +2971,13 @@ void write_fast_map() {
 		return shown_path(clip);
 	};
 	std::string       out  = "*=" + (g_store_only ? shown(store_clip()) : g_main_video ? shown(g_current) : std::string("hide")) + "\n";
-	const bool        main_4k = !g_store_only && g_main_video && clip_is_big(g_current); // 4K main: no videos per game
-	const std::string text    = g_game_videos && !g_store_only && !main_4k ? read_text(kGamesFile, 64 * 1024) : std::string();
+	const std::string text = g_game_videos && !g_store_only ? read_text(kGamesFile, 64 * 1024) : std::string(); // 4K per game too (v1.7.0)
 	size_t            pos  = 0;
 	while (pos < text.size()) {
 		const size_t      end  = text.find('\n', pos);
 		const std::string line = text.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
 		const size_t      eq   = line.find('=');
-		if (eq != std::string::npos && eq > 0 && line.compare(0, eq, "NPXS40047") != 0 && // Store: only in its own mode
-		    !clip_is_big(line.substr(eq + 1))) {                                              // 4K: main wallpaper only
+		if (eq != std::string::npos && eq > 0) { // the PS Store tile too (v1.7.0); in "PS Store only" mode this list is empty
 			out += line.substr(0, eq) + "=" + shown(line.substr(eq + 1)) + "\n";
 		}
 		if (end == std::string::npos) {
@@ -2424,13 +3111,8 @@ std::vector<Game> list_games() {
 // the same tile, play that game's clip (games.txt) instead of the main one; elsewhere, the main one.
 // What PLAYS for a tile: its saved clip, unless "Videos per game" is off (then the main one).
 std::string game_clip(const std::string& tid) {
-	// A 4K main wallpaper pauses videos per game (user: "4K for all, or 1080p for all + per game"): every tile
-	// would switch the decoder 4K <-> 1080p (slow, black). The picks stay saved.
-	if (g_main_video && clip_is_big(g_current)) {
-		return {};
-	}
-	const std::string c = g_game_videos && !g_store_only && tid != "NPXS40047" ? saved_game_clip(tid) : std::string();
-	return clip_is_big(c) ? std::string() : c; // 4K is for the main wallpaper only: an old pick uses the main one
+	// v1.7.0: 4K per game is back (kept players + the 4K warm-up make switching fast).
+	return g_game_videos && !g_store_only ? saved_game_clip(tid) : std::string(); // the PS Store tile too (v1.7.0)
 }
 
 // 4K plays (v1.4, UHD stream); bigger than 4K does not: say so instead of a black screen. True = refused
@@ -2571,7 +3253,7 @@ void* cycle_thread(void*) {
 				}
 				continue;
 			}
-			if (time(nullptr) - g_cycle_at < static_cast<time_t>(on->every) * 60) {
+			if (on->every == 0 || time(nullptr) - g_cycle_at < static_cast<time_t>(on->every) * 60) { // 0: when it ends
 				continue;
 			}
 			current = g_current;
@@ -2600,13 +3282,105 @@ void* cycle_thread(void*) {
 		g_current = *next;
 		save_config();
 		save_user_wall(g_current);
-		if (g_main_video && clip_is_big(g_current)) {
-			g_override.clear();
-		}
 		log("playlist %s: next wallpaper %s", pl.name.c_str(), g_current.c_str());
 		std::string error;
 		if (!apply_locked(error)) {
 			log("cycle: %s", error.c_str());
+		}
+	}
+	return nullptr;
+}
+
+// A video ended (issue #11): a playlist that is on with Change "When it ends" -> its next video (in order, or
+// shuffled with its Shuffle switch); no playlist on -> Auto-next (in order / shuffled) through all videos.
+// Shuffled = every video once before any repeats (a "bag"). Anything else: the clip just loops.
+void* autonext_thread(void*) {
+	std::vector<std::string> bag;
+	while (g_running) {
+		usleep(200 * 1000);
+		if (!g_ended.exchange(false)) {
+			continue;
+		}
+		std::string ended;
+		{
+			std::lock_guard<std::mutex> lock(g_ui_lock);
+			ended = g_ended_clip;
+		}
+		std::vector<std::string> pool;
+		int                      mode = 0;
+		std::string              current;
+		{
+			std::lock_guard<std::mutex> lock(g_ctl);
+			const Playlist* on = nullptr;
+			for (const Playlist& p : g_playlists) {
+				on = p.on ? &p : on;
+			}
+			mode = on != nullptr ? (on->every == 0 ? (on->shuffle ? 2 : 1) : 0) : g_autonext;
+			if (mode == 0 || !on_now() || !g_injected || g_game_running || g_game_open || g_store_only || !g_main_video ||
+			    !g_override.empty() || g_current.empty() ||
+			    ended.substr(ended.rfind('/') + 1) != g_current.substr(g_current.rfind('/') + 1)) { // by name: 4K plays from a stream address
+				continue; // off, or not the main wallpaper that ended (a game's own video, PS Store only ...)
+			}
+			current = g_current;
+			if (on != nullptr) {
+				pool = on->videos;
+			}
+		}
+		if (pool.empty()) {
+			for (const Video& v : list_videos()) {
+				pool.push_back(v.path);
+			}
+		}
+		pool.erase(std::remove_if(pool.begin(), pool.end(), [](const std::string& v) { return !exists(v.c_str()); }), pool.end());
+		if (pool.size() < 2) {
+			continue;
+		}
+		std::string next;
+		if (mode == 2) {
+			for (int guard = 0; next.empty() && guard < 2 * static_cast<int>(pool.size()) + 2; ++guard) {
+				bag.erase(std::remove_if(bag.begin(), bag.end(),
+				                         [&](const std::string& v) { return std::find(pool.begin(), pool.end(), v) == pool.end(); }),
+				          bag.end());
+				if (bag.empty()) { // a new round: every video once, the one playing not first
+					bag = pool;
+					for (size_t i = bag.size() - 1; i > 0; --i) {
+						std::swap(bag[i], bag[static_cast<size_t>(rand()) % (i + 1)]);
+					}
+					if (bag.back() == current) {
+						std::swap(bag.front(), bag.back());
+					}
+				}
+				const std::string c = bag.back();
+				bag.pop_back();
+				if (c != current && clip_problem(c).empty()) {
+					next = c;
+				}
+			}
+		} else {
+			const auto at = std::find(pool.begin(), pool.end(), current);
+			size_t     i  = at == pool.end() ? pool.size() - 1 : static_cast<size_t>(at - pool.begin());
+			for (size_t k = 0; k < pool.size() && next.empty(); ++k) {
+				i = (i + 1) % pool.size();
+				if (pool[i] != current && clip_problem(pool[i]).empty()) {
+					next = pool[i];
+				}
+			}
+		}
+		if (next.empty()) {
+			continue;
+		}
+		std::lock_guard<std::mutex> lock(g_ctl);
+		if (g_current != current) {
+			continue; // the user picked one meanwhile
+		}
+		g_current  = next;
+		g_cycle_at = time(nullptr);
+		save_config();
+		save_user_wall(g_current);
+		log("video ended, next (%s): %s", mode == 1 ? "in order" : "shuffled", g_current.c_str());
+		std::string error;
+		if (!apply_locked(error)) {
+			log("next video: %s", error.c_str());
 		}
 	}
 	return nullptr;
@@ -2690,6 +3464,16 @@ int main() {
 	mkdir("/data/LiveShell", 0777);
 	mkdir("/data/LiveShell/video", 0777);
 	mkdir("/system_tmp/liveshell", 0777);
+	// The files ShellUI cannot do without get their slot first (/system_tmp: ~33 files for everyone).
+	for (const char* f : {kPathFile, kOptsFile, "/system_tmp/liveshell/fast.txt", "/system_tmp/liveshell/games.txt"}) {
+		if (!exists(f)) {
+			write_text(f, f == kPathFile ? "off\n" : "");
+		}
+	}
+	// The old per-setting files of an earlier version (each took a slot).
+	for (const char* n : kOptNames) {
+		unlink((std::string("/system_tmp/liveshell/") + n).c_str());
+	}
 	// Loading the payload = try again: a crash marker from an earlier run must not keep the video
 	// off until the next reboot.
 	unlink("/system_tmp/liveshell/video_trying");
@@ -2748,10 +3532,42 @@ int main() {
 	}
 
 	start_thread(ui_thread); // before the injection: ShellUI talks to us from its first line
+#ifdef LIVESHELL_RESEARCH_DUMP
+	start_thread(dump_rx_thread);
+#endif
 	start_thread(power_thread);
 	start_thread(stop_thread);
 	start_web_server();
+#ifdef LIVESHELL_RESEARCH_RETRO
+	retro_start([](const char* line) { log("%s", line); }, [](const char* line) { notify(line); });
+#endif
 
+#ifdef LIVESHELL_FAST
+	// liveshell-fast.elf: no wait after power-on, the wallpaper starts at once (user: two versions from v1.6.0).
+	unlink(kEarlyCrashFile); // the safe build's note: not used here
+#else
+	// liveshell.elf: right after the PS5 was turned on, the home screen is still starting up and a HEN's toolbox
+	// takes longer to get in: a jailbreak + OnionHEN + LiveShell in the first minutes crashed the home screen;
+	// 5 min after power-on it was fine (issue #16). Inject no earlier than 2 min after power-on (5 min after a
+	// crash last time).
+	{
+		timespec up {};
+		clock_gettime(CLOCK_MONOTONIC, &up);
+		const bool crashed_before = exists(kEarlyCrashFile);
+		const long kSettled       = crashed_before ? 300 : 120;
+		if (crashed_before) {
+			log("last time the home screen crashed soon after LiveShell joined it: waiting until 5 min after power-on");
+		}
+		if (up.tv_sec < kSettled) {
+			log("the PS5 was turned on %ld s ago: waiting %ld s more before joining the home screen", static_cast<long>(up.tv_sec),
+			    kSettled - static_cast<long>(up.tv_sec));
+			for (long left = kSettled - up.tv_sec; left > 0 && g_running; --left) {
+				sleep(1);
+			}
+		}
+	}
+#endif
+	wait_for_hen_toolboxes(true); // autoload: the HEN loaded just before may still be putting its toolbox in
 	pid_t last_pid = inject_shellui();
 	if (last_pid < 0) {
 		return 3;
@@ -2784,12 +3600,20 @@ int main() {
 	load_playlists();
 	start_thread(user_thread);
 	start_thread(cycle_thread);
+	start_thread(autonext_thread);
+	start_thread(recovery_thread);
 
 	// Re-inject after ShellUI restarts. A restart soon after an injection means our module crashed
 	// it: stop for good instead of crash-looping the console.
 	time_t injected_at = time(nullptr);
 	while (g_running) {
 		sleep(5);
+#ifndef LIVESHELL_FAST
+		if (time(nullptr) - injected_at > kCrashWindowSec && exists(kEarlyCrashFile)) {
+			unlink(kEarlyCrashFile);
+			log("the home screen runs fine with LiveShell: back to the normal wait after power-on");
+		}
+#endif
 		if (!g_running) {
 			break;
 		}
@@ -2819,12 +3643,32 @@ int main() {
 				current = now;
 			}
 		}
-		if (!by_rest && alive < kCrashWindowSec) {
-			log("ShellUI died %ld s after injection: treating it as a crash, not re-injecting", alive);
-			notify("LiveShell Engine stopped: the home screen crashed. Log: /data/LiveShell/liveshell.log");
-			break;
+		if (g_planned_restart.exchange(false)) {
+			log("ShellUI restarted by LiveShell (old module cleared): injecting again");
+		} else if (!by_rest && alive < kCrashWindowSec) {
+#ifndef LIVESHELL_FAST
+			write_text(kEarlyCrashFile, std::to_string(alive) + "\n"); // next start waits longer after power-on
+#endif
+			// Once per session: the home screen may simply have still been starting up. Give the new one a minute,
+			// then try again (it used to stop until the ELF was loaded again).
+			static bool retried = false;
+			if (retried) {
+				log("ShellUI died %ld s after injection again: treating it as a crash, not re-injecting", alive);
+				notify("LiveShell Engine stopped: the home screen crashed. Log: /data/LiveShell/liveshell.log");
+				break;
+			}
+			retried = true;
+			log("ShellUI died %ld s after injection: trying once more in 60 s", alive);
+			for (int k = 0; k < 60 && g_running; ++k) {
+				sleep(1);
+			}
+			const pid_t now = onion_find_pid("SceShellUI");
+			if (now > 0) {
+				current = now;
+			}
 		}
 		sleep(3); // let the new ShellUI settle
+		wait_for_hen_toolboxes(false);
 		{
 			std::lock_guard<std::mutex> lock(g_ctl);
 			g_injected = false; // the new ShellUI has no module yet: no waiting for it to let go
@@ -2856,7 +3700,9 @@ int main() {
 		}
 		unmount_window_everywhere();
 		log("LiveShell stopped (soft: OnionHEN keeps running, the idle module stays in ShellUI)");
-		notify("LiveShell Engine stopped.");
+		if (!g_replaced) {
+			notify("LiveShell Engine stopped."); // not when a newer LiveShell takes over (it says it started)
+		}
 		_exit(0); // see below
 	}
 	write_text(kPathFile, "off\n");
@@ -2869,7 +3715,9 @@ int main() {
 	unlink(kStatusFile);
 	ui_forget_status();
 	log("LiveShell stopped");
-	notify("LiveShell Engine stopped.");
+	if (!g_replaced) {
+		notify("LiveShell Engine stopped."); // not when a newer LiveShell takes over (it says it started)
+	}
 	// _exit, not return: with libSceNet/libSceHttp linked, a normal exit hung in their
 	// shutdown and the process stayed alive holding ports 9049/9050/9051 - the next LiveShell got a white
 	// window and no shutdown (v1.3 test).
