@@ -7,7 +7,7 @@
 <p align="center"><b>Animated video wallpapers for the PS5 home screen.</b></p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.5-white?style=flat-square" alt="version">
+  <img src="https://img.shields.io/badge/version-1.7.0-white?style=flat-square" alt="version">
   <img src="https://img.shields.io/badge/platform-PS5-white?style=flat-square" alt="platform">
   <img src="https://img.shields.io/badge/video-H.264%20%7C%20HEVC%20%E2%89%A44K-white?style=flat-square" alt="video">
   <img src="https://img.shields.io/badge/license-GPL--3.0-white?style=flat-square" alt="license">
